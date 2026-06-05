@@ -41,8 +41,6 @@ enum PACKET_TYPE {
 
 	C2S_LOGOUT,			// Client to Server: Logout request
 
-
-
 	S2C_LOGIN_RESULT,	//	Server to Client: Login result
 						// 로그인 결과 패킷 (성공 여부와 메시지 포함)
 	S2C_AVATAR_INFO,	//	Server to Client: Avatar information
