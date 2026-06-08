@@ -11,6 +11,8 @@
 #include <concurrent_priority_queue.h>
 #include <tbb/concurrent_unordered_map.h>
 #include "protocol_2026.h"
+#include <fstream>
+#include <sstream>
 
 #pragma comment(lib, "WS2_32.lib")
 #pragma comment(lib, "MSWSock.lib")

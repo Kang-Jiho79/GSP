@@ -34,7 +34,6 @@ enum PACKET_TYPE {
 	C2S_REINFORCE,		// Client to Server: Reinforce request (weapon upgrade)
 	// party related actions
 	C2S_INVITE_PARTY,	// Client to Server: Invite party request
-	C2S_APPLY_PARTY,	// Client to Server: Apply party request
 	C2S_ACCEPT_PARTY,	// Client to Server: Accept party request
 	C2S_REFUSE_PARTY,	// Client to Server: Refuse party request
 	C2S_LEAVE_PARTY,	// Client to Server: Leave party request
@@ -58,12 +57,20 @@ enum PACKET_TYPE {
 	S2C_PARTY_INVITE_NOTI,	//	Server to Client: Party invite notification
 	S2C_PARTY_APPLY_NOTI,		//	Server to Client: Party application notification
 	S2C_PARTY_UPDATE,			//	Server to Client: Party status update (e.g., new member, member left)
+	S2C_ATTACK_BROADCAST        // Server to Client: Broadcast attack action
+};
+
+enum OBJECT_TYPE {
+	player = 0,
+	npc,
+	monster
 };
 
 enum WEAPON_TYPE {
-	SWORD,
-	HAMMER,
-	SPEAR
+	null = 0,
+	sword,
+	hammer,
+	spear
 };
 
 enum DUNGEON_TYPE {
@@ -77,17 +84,47 @@ enum DUNGEON_TYPE {
 	FINAL_BOSS
 };
 
+struct PortalInfo {
+	DUNGEON_TYPE dungeon;
+	short src_x, src_y;
+	short dest_x, dest_y;
+	unsigned char required_level;
+};
+
+const std::vector<PortalInfo> Portals = {
+	{ DUNGEON_1, 1099, 900, 1350, 649, 0 },
+	{ DUNGEON_2, 1099, 1000, 1350, 1000, 5 },
+	{ DUNGEON_3, 1099, 1099, 1350, 1350, 10 },
+	{ DUNGEON_4, 1000, 1099, 1000, 1350, 15 },
+	{ DUNGEON_5, 900, 1099, 649, 1350, 20 },
+	{ DUNGEON_6, 900, 1000, 649, 1000, 25 },
+	{ DUNGEON_7, 900, 900, 649, 649, 30 },
+	{ FINAL_BOSS, 1000, 900, 730, 649, 40 }
+};
+
+enum NPC_TYPE {
+	NPC_REINFORCE = 1, // 강화 상인
+};
+
+struct NpcSpawnInfo {
+	NPC_TYPE    type;
+	short       x, y;
+	std::string name;
+};
+
+const std::vector<NpcSpawnInfo> g_npc_spawns = {
+	{ NPC_REINFORCE, 1000, 1000, "강화 상인" }
+};
+
 
 #pragma pack(push, 1) // Ensure no padding between struct members
 
 struct PartyMemberInfo {
 	int					playerId;
-	char					username[MAX_NAME_LEN];
-	WEAPON_TYPE			weapon;
+	char				username[MAX_NAME_LEN];
 	int					hp;
 	int					max_hp;
-	unsigned long long	exp;
-	unsigned char			level;
+	unsigned char		level;
 };
 
 struct C2S_Login {
@@ -166,12 +203,6 @@ struct C2S_InviteParty {
 	char					target_username[MAX_NAME_LEN];
 };
 
-struct C2S_ApplyParty {
-	unsigned char			size;
-	PACKET_TYPE				type;
-	char					target_username[MAX_NAME_LEN];
-};
-
 struct C2S_AcceptParty {
 	unsigned char			size;
 	PACKET_TYPE				type;
@@ -182,6 +213,11 @@ struct C2S_RefuseParty {
 	unsigned char			size;
 	PACKET_TYPE				type;
 	char					target_username[MAX_NAME_LEN];
+};
+
+struct C2S_LeaveParty {
+	unsigned char			size;
+	PACKET_TYPE				type;
 };
 
 struct C2S_Logout {
@@ -280,7 +316,7 @@ struct S2C_InfoResult
 	int					hp;
 	int					max_hp;
 	int					gold;
-	unsigned char				reinforce_level;
+	unsigned char			reinforce_level;
 	unsigned long long	exp;
 	unsigned char			level;
 	bool					in_party;
@@ -313,14 +349,6 @@ struct S2C_PartyInviteNoti
 	char					inviter_username[MAX_NAME_LEN];
 };
 
-struct S2C_PartyApplyNoti
-{
-	unsigned char			size;
-	PACKET_TYPE			type;
-	int					playerId;
-	char					applicant_username[MAX_NAME_LEN];
-};
-
 struct S2C_PartyUpdate
 {
 	unsigned char			size;
@@ -328,6 +356,13 @@ struct S2C_PartyUpdate
 	int					playerId;
 	int					party_member_count;
 	PartyMemberInfo		party_members[MAX_PARTY_SIZE];
+};
+
+struct S2C_AttackBroadcast {
+	unsigned char size;
+	PACKET_TYPE   type;
+	int           attacker_id;
+	WEAPON_TYPE   weapon;
 };
 
 #pragma pack(pop) // Restore default packing

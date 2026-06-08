@@ -27,6 +27,9 @@
     <ClInclude Include="client.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\Server\server\protocol_2026.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="client.cpp">
@@ -45,5 +48,10 @@
     <Image Include="client.ico">
       <Filter>리소스 파일</Filter>
     </Image>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\..\Resource\world.csv">
+      <Filter>리소스 파일</Filter>
+    </None>
   </ItemGroup>
 </Project>

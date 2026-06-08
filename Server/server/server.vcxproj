@@ -116,6 +116,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -123,8 +124,15 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="DB.h" />
     <ClInclude Include="GameData.h" />
     <ClInclude Include="GameObject.h" />
+    <ClInclude Include="include\lauxlib.h" />
+    <ClInclude Include="include\lua.h" />
+    <ClInclude Include="include\lua.hpp" />
+    <ClInclude Include="include\luaconf.h" />
+    <ClInclude Include="include\lualib.h" />
+    <ClInclude Include="LuaManager.h" />
     <ClInclude Include="NPC.h" />
     <ClInclude Include="Player.h" />
     <ClInclude Include="protocol_2026.h" />
@@ -132,14 +140,20 @@
     <ClInclude Include="stdafx.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="DB.cpp" />
     <ClCompile Include="GameObject.cpp" />
+    <ClCompile Include="LuaManager.cpp" />
     <ClCompile Include="NPC.cpp" />
     <ClCompile Include="Player.cpp" />
     <ClCompile Include="server.cpp" />
     <ClCompile Include="Session.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="..\..\Resource\world.csv" />
     <None Include="packages.config" />
+  </ItemGroup>
+  <ItemGroup>
+    <Library Include="lua55.lib" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

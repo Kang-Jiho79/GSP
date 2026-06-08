@@ -13,6 +13,9 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="헤더 파일\LUA">
+      <UniqueIdentifier>{8405a55c-9f3b-4498-919a-9cc58996fc4d}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="protocol_2026.h">
@@ -36,6 +39,27 @@
     <ClInclude Include="GameData.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
+    <ClInclude Include="DB.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="LuaManager.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="include\lauxlib.h">
+      <Filter>헤더 파일\LUA</Filter>
+    </ClInclude>
+    <ClInclude Include="include\lua.h">
+      <Filter>헤더 파일\LUA</Filter>
+    </ClInclude>
+    <ClInclude Include="include\lua.hpp">
+      <Filter>헤더 파일\LUA</Filter>
+    </ClInclude>
+    <ClInclude Include="include\luaconf.h">
+      <Filter>헤더 파일\LUA</Filter>
+    </ClInclude>
+    <ClInclude Include="include\lualib.h">
+      <Filter>헤더 파일\LUA</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="server.cpp">
@@ -53,8 +77,22 @@
     <ClCompile Include="NPC.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
+    <ClCompile Include="DB.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="LuaManager.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
+    <None Include="..\..\Resource\world.csv">
+      <Filter>리소스 파일</Filter>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <Library Include="lua55.lib">
+      <Filter>리소스 파일</Filter>
+    </Library>
   </ItemGroup>
 </Project>
