@@ -89,6 +89,9 @@
     <None Include="..\..\Resource\world.csv">
       <Filter>리소스 파일</Filter>
     </None>
+    <None Include="moster_ai.lua">
+      <Filter>리소스 파일</Filter>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <Library Include="lua55.lib">

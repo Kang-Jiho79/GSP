@@ -144,10 +144,10 @@ void send_login_packet()
 	memcpy(g_send_buf, &packet, sizeof(C2S_Login));
 	g_send_wsa_buf.buf = g_send_buf;
 	g_send_wsa_buf.len = sizeof(C2S_Login);
-
 	ZeroMemory(&g_send_over, sizeof(g_send_over));
 	DWORD sent_size = 0;
 	WSASend(g_s_socket, &g_send_wsa_buf, 1, &sent_size, 0, &g_send_over, send_callback);
+	std::cout << "Login packet sent for username: " << username << std::endl;
 }
 
 void send_move_packet(short dx, short dy)
@@ -409,6 +409,8 @@ void process_packet(unsigned char* p)
 		obj.hp = packet->hp; obj.max_hp = packet->max_hp;
 		obj.level = packet->level;
 		strncpy_s(obj.username, packet->obj_name, _TRUNCATE);
+
+		obj.visual_id = packet->visual_id;
 
 		g_objects[obj.id] = obj;
 		should_repaint = true;
@@ -888,7 +890,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			}
 
 			// 오브젝트 렌더링
-			for (auto& pair : g_objects) {
+			for(auto& pair : g_objects) {
 				ClientObject& obj = pair.second;
 
 				int diffX = obj.x - myObj.x;
@@ -898,26 +900,41 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 					int drawX = CENTER_X + (diffX * TILE_SIZE) + (TILE_SIZE / 2);
 					int drawY = CENTER_Y + (diffY * TILE_SIZE) + (TILE_SIZE / 2);
 
-					// --- [기능 1] Visual ID 및 속성에 따른 색상 구분 렌더링 ---
-					HBRUSH hBrush;
+					HBRUSH hBrush = nullptr;
+
 					if (obj.id == g_myid) {
 						hBrush = CreateSolidBrush(RGB(255, 0, 0)); // 내 캐릭터 (빨강)
 					}
-					else if (obj.visual_id != player) {
-						if (obj.visual_id == npc) hBrush = CreateSolidBrush(RGB(0, 255, 0)); // 강화 NPC (초록)
-						else if (obj.visual_id == monster) hBrush = CreateSolidBrush(RGB(128, 0, 128)); // 몬스터 (보라)
-						else hBrush = CreateSolidBrush(RGB(150, 150, 150)); // 기타 일반 NPC (회색)
+					else if (obj.id >= MAX_PLAYERS) {
+						// 💥 [핵심 변경] visual_id 몬스터 템플릿 등급별 고유 아이콘 색상 할당!
+						switch (obj.visual_id) {
+						case 1: hBrush = CreateSolidBrush(RGB(0, 255, 128));   break; // 슬라임 (에메랄드 그린)
+						case 2: hBrush = CreateSolidBrush(RGB(139, 69, 19));   break; // 고블린 (갈색)
+						case 3: hBrush = CreateSolidBrush(RGB(75, 0, 130));    break; // 트롤 (인디고 보라)
+						case 4: hBrush = CreateSolidBrush(RGB(240, 240, 240)); break; // 스켈레톤 (하얀 해골색)
+						case 5: hBrush = CreateSolidBrush(RGB(47, 79, 79));    break; // 좀비 (다크 그레이)
+						case 6: hBrush = CreateSolidBrush(RGB(30, 144, 255));  break; // 마법사 (네온 블루)
+						case 7: hBrush = CreateSolidBrush(RGB(255, 69, 0));    break; // 드래곤 (강렬한 주황)
+						default: hBrush = CreateSolidBrush(RGB(128, 128, 128)); break; // 기본 더미형 (회색)
+						}
 					}
 					else {
 						hBrush = CreateSolidBrush(RGB(0, 0, 255)); // 타 플레이어 (파랑)
 					}
 
 					HBRUSH hOldBrush = (HBRUSH)SelectObject(memDC, hBrush);
-
 					int radius = min(TILE_SIZE / 2, 20) - 2;
-					Ellipse(memDC, drawX - radius, drawY - radius, drawX + radius, drawY + radius);
+
+					// 🐉 만약 드래곤(7번 보스) 등급이라면 위엄을 위해 크기를 1.5배 크게 그리는 연출 추가 가능!
+					if (obj.visual_id == 7) {
+						Ellipse(memDC, drawX - (radius + 6), drawY - (radius + 6), drawX + (radius + 6), drawY + (radius + 6));
+					}
+					else {
+						Ellipse(memDC, drawX - radius, drawY - radius, drawX + radius, drawY + radius);
+					}
+
 					SelectObject(memDC, hOldBrush);
-					DeleteObject(hBrush);
+					DeleteObject(hBrush);;
 					DWORD currentTime = GetTickCount();
 					// ⭐ [변경됨] 내가 아니더라도, 150ms 내에 공격한 '모든' 캐릭터에 이펙트 그리기
 					if (currentTime - obj.last_attack_time < ATTACK_EFFECT_DURATION) {
@@ -963,7 +980,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 							}
 						}
 
-						// 자원 해제
+						// 자원 해제	
 						SelectObject(memDC, oldBrush);
 						SelectObject(memDC, oldPen);
 						DeleteObject(effectPen);
