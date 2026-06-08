@@ -46,6 +46,7 @@ const DWORD ATTACK_EFFECT_DURATION = 150; // 이펙트 지속 시간 (150 밀리
 bool g_show_party_invite_popup = false;  // 파티 초대 팝업 열림 여부
 int g_inviter_id = -1;                   // 나를 초대한 사람의 ID
 char g_inviter_name[MAX_NAME_LEN] = "";  // 나를 초대한 사람의 이름
+bool g_is_space_pressed = false;
 
 // 마우스 클릭 시 사용할 임시 사각형(버튼 영역) 선언
 RECT g_rect_invite_btn = { 0, 0, 0, 0 };
@@ -393,11 +394,23 @@ void process_packet(unsigned char* p)
 		obj.x = packet->x; obj.y = packet->y;
 		obj.hp = packet->hp; obj.max_hp = packet->max_hp;
 		obj.level = packet->level;
+
+		obj.weapon = static_cast<WEAPON_TYPE>(packet->visualId);
+
 		strncpy_s(obj.username, packet->username, _TRUNCATE);
 
 		g_objects[g_myid] = obj;
 		should_repaint = true;
 
+		if (obj.weapon == null) {
+			std::cout << "\n=============================================" << std::endl;
+			std::cout << " [9-Realms] 최초 접속을 환영합니다! 무기를 선택해 주세요." << std::endl;
+			std::cout << "=============================================" << std::endl;
+			send_select_weapon_packet();
+		}
+		else {
+			std::cout << "\n[9-Realms] 기존 캐릭터 정보를 안전하게 로드했습니다. (현재 무기 코드: " << (int)obj.weapon << ")" << std::endl;
+		}
 		break;
 	}
 	case S2C_ADD_OBJECT:
@@ -438,6 +451,7 @@ void process_packet(unsigned char* p)
 		S2C_StatusChange* packet = reinterpret_cast<S2C_StatusChange*>(p);
 		if (g_objects.count(packet->object_id)) {
 			g_objects[packet->object_id].hp = packet->hp;
+			g_objects[packet->object_id].max_hp = packet->max_hp;
 			g_objects[packet->object_id].level = packet->level;
 			should_repaint = true;
 		}
@@ -630,6 +644,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	switch (message)
 	{
+		// 💥 [추가] 스페이스바에서 손을 떼는 순간을 감지하여 플래그를 초기화합니다.
+	case WM_KEYUP:
+	{
+		if (wParam == VK_SPACE) {
+			g_is_space_pressed = false;
+		}
+		break;
+	}
+
 	case WM_KEYDOWN:
 	{
 		short dx = 0, dy = 0;
@@ -639,34 +662,34 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		case VK_UP:    dy = -1; break;
 		case VK_DOWN:  dy = 1;  break;
 		case VK_SPACE:
-			send_attack_packet();
-			if (g_myid != -1 && g_objects.count(g_myid)) {
-				g_objects[g_myid].last_attack_time = GetTickCount(); // ⭐ 내 공격 시간 갱신
+			// ⭐ [기능 1] 키 반복 입력 필터링: 누르고 있어도 최초 1회만 단발성 공격 감행!
+			if (!g_is_space_pressed) {
+				g_is_space_pressed = true;
+				send_attack_packet();
+				if (g_myid != -1 && g_objects.count(g_myid)) {
+					g_objects[g_myid].last_attack_time = GetTickCount();
+				}
+				InvalidateRect(hWnd, NULL, TRUE);
+				SetTimer(hWnd, 1, ATTACK_EFFECT_DURATION, NULL);
 			}
-			InvalidateRect(hWnd, NULL, TRUE);
-			SetTimer(hWnd, 1, ATTACK_EFFECT_DURATION, NULL);
 			break;
 		case 'A':
 		case 'a':
 		{
 			if (g_myid != -1 && g_objects.count(g_myid)) {
 				auto& myObj = g_objects[g_myid];
-
-				// 내가 현재 포탈 위에 서 있는지 루프를 돌며 확인
 				bool isOnPortal = false;
 				for (const auto& portal : Portals) {
 					if (myObj.x == portal.src_x && myObj.y == portal.src_y) {
 						send_dungeon_entry_packet(portal.dungeon);
 						std::cout << "[디버그] A키 상호작용! 던전 입장 요청을 보냈습니다. 타입: " << portal.dungeon << std::endl;
 						isOnPortal = true;
-						break; // 포탈을 찾았으니 루프 탈출
+						break;
 					}
 				}
 
 				if (!isOnPortal) {
 					bool is_near_npc = false;
-
-					// ⭐ NPC 테이블을 뒤져서 내가 상인 주변에 서 있는지 검사
 					for (const auto& npc : g_npc_spawns) {
 						if (abs(myObj.x - npc.x) <= 1 && abs(myObj.y - npc.y) <= 1) {
 							is_near_npc = true;
@@ -676,7 +699,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 					if (is_near_npc) {
 						if (g_show_reinforce_ui) {
-							g_show_reinforce_ui = false; // 토글식 닫기
+							g_show_reinforce_ui = false;
 							InvalidateRect(hWnd, NULL, TRUE);
 						}
 						else {
@@ -690,7 +713,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		case 'T':
 			send_teleport_packet(WORLD_WIDTH / 2, WORLD_HEIGHT / 2);
 			break;
-		case VK_ESCAPE: // ESC 누르면 UI 닫기
+		case VK_ESCAPE:
 			g_selected_target_id = -1;
 			g_show_reinforce_ui = false;
 			InvalidateRect(hWnd, NULL, TRUE);
@@ -701,13 +724,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	}
 
 	case WM_TIMER:
-		if (wParam == 1) // 1번 타이머라면
+		if (wParam == 1)
 		{
-			InvalidateRect(hWnd, NULL, TRUE); // 화면 갱신
+			InvalidateRect(hWnd, NULL, TRUE);
 		}
 		break;
 
-	case WM_LBUTTONDOWN: // [기능 4, 5] 마우스 클릭 처리
+	case WM_LBUTTONDOWN:
 	{
 		int mouseX = LOWORD(lParam);
 		int mouseY = HIWORD(lParam);
@@ -715,34 +738,29 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 		if (g_show_party_invite_popup) {
 			if (PtInRect(&g_rect_party_accept_btn, pt)) {
-				// 수락 버튼 클릭 시 서버로 수락 패킷 전송
 				send_party_accept_packet(g_inviter_name);
-				g_show_party_invite_popup = false; // 팝업 닫기
+				g_show_party_invite_popup = false;
 				return 0;
 			}
 			else if (PtInRect(&g_rect_party_refuse_btn, pt)) {
-				// 거절 버튼 클릭 시 서버로 거절 패킷 전송
 				send_party_refuse_packet(g_inviter_name);
-				g_show_party_invite_popup = false; // 팝업 닫기
+				g_show_party_invite_popup = false;
 				return 0;
 			}
 		}
 
-		// 1. 강화창이 열려있을 때 버튼 클릭 확인
 		if (g_show_reinforce_ui) {
 			if (PtInRect(&g_rect_reinforce_btn, pt)) {
-				// 현재 무기와 강화 레벨을 서버로 전송
 				ClientObject& myObj = g_objects[g_myid];
 				send_reinforce_packet(myObj.weapon, myObj.reinforce_level, myObj.gold);
 			}
 			else if (PtInRect(&g_rect_close_reinforce_btn, pt)) {
-				g_show_reinforce_ui = false; // 닫기 버튼
+				g_show_reinforce_ui = false;
 				InvalidateRect(hWnd, NULL, TRUE);
 			}
-			return 0; // UI 클릭 시 캐릭터 클릭은 무시
+			return 0;
 		}
 
-		// 2. 타겟 상태창이 열려있을 때 파티 초대 버튼 클릭 확인
 		if (g_selected_target_id != -1 && g_selected_target_id != g_myid) {
 			if (PtInRect(&g_rect_invite_btn, pt)) {
 				std::string targetName = g_objects[g_selected_target_id].username;
@@ -751,13 +769,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			}
 		}
 
-		// 2. [파티 탈퇴 버튼] - 타겟팅 상태와 무관하게 언제나 독립적으로 작동
 		if (PtInRect(&g_rect_leave_btn, pt)) {
 			send_party_leave_packet();
 			return 0;
 		}
 
-		// 3. 필드 위 캐릭터(원형) 클릭 확인
 		if (g_myid != -1 && g_objects.count(g_myid)) {
 			ClientObject& myObj = g_objects[g_myid];
 			const int VIEW_RADIUS = 10;
@@ -776,17 +792,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 					int drawX = CENTER_X + (diffX * TILE_SIZE) + (TILE_SIZE / 2);
 					int drawY = CENTER_Y + (diffY * TILE_SIZE) + (TILE_SIZE / 2);
 
-					// 마우스 좌표와 오브젝트 중심 간의 거리 계산 (피타고라스)
 					int distSq = (mouseX - drawX) * (mouseX - drawX) + (mouseY - drawY) * (mouseY - drawY);
 					if (distSq <= radius * radius) {
-						g_selected_target_id = obj.id; // 타겟 설정
+						g_selected_target_id = obj.id;
 						clicked_someone = true;
 						InvalidateRect(hWnd, NULL, TRUE);
 						break;
 					}
 				}
 			}
-			// 허공을 클릭하면 타겟 해제
 			if (!clicked_someone) {
 				g_selected_target_id = -1;
 				InvalidateRect(hWnd, NULL, TRUE);
@@ -795,32 +809,30 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 	}
 
-	// ⭐ [핵심 1] 윈도우 기본 배경 지우기 무시 (깜빡임의 주원인 제거)
 	case WM_ERASEBKGND:
-		return 1; // 1(TRUE)을 반환하면 운영체제가 배경을 지우지 않음
+		return 1;
 
 	case WM_PAINT:
 	{
 		PAINTSTRUCT ps;
 		HDC hdc = BeginPaint(hWnd, &ps);
 
-		// 현재 클라이언트 영역(창 크기) 가져오기
 		RECT rect;
 		GetClientRect(hWnd, &rect);
 		int width = rect.right - rect.left;
 		int height = rect.bottom - rect.top;
 
-		// ⭐ [핵심 2] 더블 버퍼링을 위한 메모리 DC 및 비트맵 생성
 		HDC memDC = CreateCompatibleDC(hdc);
 		HBITMAP memBitmap = CreateCompatibleBitmap(hdc, width, height);
 		HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
 
-		// 가상 도화지(memDC)의 배경을 흰색으로 초기화
 		HBRUSH bgBrush = CreateSolidBrush(RGB(255, 255, 255));
 		FillRect(memDC, &rect, bgBrush);
 		DeleteObject(bgBrush);
 
-		// --- 렌더링 시작 (이제부터 모든 그리기 함수는 hdc가 아닌 memDC를 사용합니다!) ---
+		// 배경 투명 텍스트 설정을 적용하여 글자 배경이 타일을 가리지 않게 조치
+		SetBkMode(memDC, TRANSPARENT);
+
 		if (g_myid != -1 && g_objects.count(g_myid)) {
 			ClientObject& myObj = g_objects[g_myid];
 
@@ -829,7 +841,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			const int CENTER_X = winLength / 2;
 			const int CENTER_Y = winLength / 2;
 
-			// 맵 렌더링
+			// 1. 타일 및 고정 오브젝트 네임태그 렌더링
 			for (int dy = -VIEW_RADIUS; dy <= VIEW_RADIUS; ++dy) {
 				for (int dx = -VIEW_RADIUS; dx <= VIEW_RADIUS; ++dx) {
 					int mapX = myObj.x + dx;
@@ -839,38 +851,39 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 						int drawX = CENTER_X + (dx * TILE_SIZE);
 						int drawY = CENTER_Y + (dy * TILE_SIZE);
 
-						// ⭐ [포탈 렌더링 핵심 로직 추가]
 						HBRUSH tileBrush = nullptr;
 						bool is_portal_tile = false;
+						std::string portal_name = "";
 
+						// 포탈 순회 체크 및 이름 정의
 						for (const auto& portal : Portals) {
-							// 현재 그리고 있는 타일 좌표가 포탈 입구 좌표라면?
 							if (mapX == portal.src_x && mapY == portal.src_y) {
 								if (portal.dungeon == FINAL_BOSS) {
-									tileBrush = CreateSolidBrush(RGB(255, 69, 0)); // 8번 최종 보스 포탈: 오렌지 레드
+									tileBrush = CreateSolidBrush(RGB(255, 69, 0));
+									portal_name = "최종 보스 포탈";
 								}
 								else {
-									tileBrush = CreateSolidBrush(RGB(0, 191, 255)); // 1~7번 일반 던전 포탈: 딥 스카이블루
+									tileBrush = CreateSolidBrush(RGB(0, 191, 255));
+									portal_name = "던전 " + std::to_string(portal.dungeon + 1) + " 포탈";
 								}
 								is_portal_tile = true;
 								break;
 							}
 						}
 
-						// 포탈 타일이 아닐 때만 기존 일반 타일(벽/바닥) 처리
-						if (!is_portal_tile) {
-							bool is_npc_tile = false;
+						bool is_npc_tile = false;
+						std::string npc_display_name = "";
 
-							// ⭐ 현재 그리고 있는 타일 좌표가 NPC 스폰 좌표인지 테이블 검사
+						if (!is_portal_tile) {
 							for (const auto& npc : g_npc_spawns) {
 								if (mapX == npc.x && mapY == npc.y) {
-									tileBrush = CreateSolidBrush(RGB(255, 215, 0)); // 황금색으로 NPC 표시
+									tileBrush = CreateSolidBrush(RGB(255, 215, 0));
+									npc_display_name = npc.name;
 									is_npc_tile = true;
 									break;
 								}
 							}
 
-							// NPC 타일도 아니라면 평범한 바닥/벽 렌더링
 							if (!is_npc_tile) {
 								tileBrush = (g_map[mapY][mapX] == 0) ?
 									CreateSolidBrush(RGB(255, 255, 255)) :
@@ -879,18 +892,26 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 						}
 
 						RECT tileRect = { drawX, drawY, drawX + TILE_SIZE, drawY + TILE_SIZE };
-						FillRect(memDC, &tileRect, tileBrush); // memDC 사용
+						FillRect(memDC, &tileRect, tileBrush);
 						DeleteObject(tileBrush);
 
 						HBRUSH borderBrush = CreateSolidBrush(RGB(220, 220, 220));
-						FrameRect(memDC, &tileRect, borderBrush); // memDC 사용
+						FrameRect(memDC, &tileRect, borderBrush);
 						DeleteObject(borderBrush);
+
+						// ⭐ [기능 3] 포탈 및 강화 NPC 위에 이름 실시간 출력 (타일 중앙 상단 배치)
+						if (is_portal_tile) {
+							TextOutA(memDC, drawX - 25, drawY - 15, portal_name.c_str(), (int)portal_name.length());
+						}
+						if (is_npc_tile) {
+							TextOutA(memDC, drawX - 20, drawY - 15, npc_display_name.c_str(), (int)npc_display_name.length());
+						}
 					}
 				}
 			}
 
-			// 오브젝트 렌더링
-			for(auto& pair : g_objects) {
+			// 2. 동적 아바타 및 몬스터 개체 렌더링
+			for (auto& pair : g_objects) {
 				ClientObject& obj = pair.second;
 
 				int diffX = obj.x - myObj.x;
@@ -903,29 +924,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 					HBRUSH hBrush = nullptr;
 
 					if (obj.id == g_myid) {
-						hBrush = CreateSolidBrush(RGB(255, 0, 0)); // 내 캐릭터 (빨강)
+						hBrush = CreateSolidBrush(RGB(255, 0, 0));
 					}
 					else if (obj.id >= MAX_PLAYERS) {
-						// 💥 [핵심 변경] visual_id 몬스터 템플릿 등급별 고유 아이콘 색상 할당!
 						switch (obj.visual_id) {
-						case 1: hBrush = CreateSolidBrush(RGB(0, 255, 128));   break; // 슬라임 (에메랄드 그린)
-						case 2: hBrush = CreateSolidBrush(RGB(139, 69, 19));   break; // 고블린 (갈색)
-						case 3: hBrush = CreateSolidBrush(RGB(75, 0, 130));    break; // 트롤 (인디고 보라)
-						case 4: hBrush = CreateSolidBrush(RGB(240, 240, 240)); break; // 스켈레톤 (하얀 해골색)
-						case 5: hBrush = CreateSolidBrush(RGB(47, 79, 79));    break; // 좀비 (다크 그레이)
-						case 6: hBrush = CreateSolidBrush(RGB(30, 144, 255));  break; // 마법사 (네온 블루)
-						case 7: hBrush = CreateSolidBrush(RGB(255, 69, 0));    break; // 드래곤 (강렬한 주황)
-						default: hBrush = CreateSolidBrush(RGB(128, 128, 128)); break; // 기본 더미형 (회색)
+						case 1: hBrush = CreateSolidBrush(RGB(0, 255, 128));   break;
+						case 2: hBrush = CreateSolidBrush(RGB(139, 69, 19));   break;
+						case 3: hBrush = CreateSolidBrush(RGB(75, 0, 130));    break;
+						case 4: hBrush = CreateSolidBrush(RGB(240, 240, 240)); break;
+						case 5: hBrush = CreateSolidBrush(RGB(47, 79, 79));    break;
+						case 6: hBrush = CreateSolidBrush(RGB(30, 144, 255));  break;
+						case 7: hBrush = CreateSolidBrush(RGB(255, 69, 0));    break;
+						default: hBrush = CreateSolidBrush(RGB(128, 128, 128)); break;
 						}
 					}
 					else {
-						hBrush = CreateSolidBrush(RGB(0, 0, 255)); // 타 플레이어 (파랑)
+						hBrush = CreateSolidBrush(RGB(0, 0, 255));
 					}
 
 					HBRUSH hOldBrush = (HBRUSH)SelectObject(memDC, hBrush);
 					int radius = min(TILE_SIZE / 2, 20) - 2;
 
-					// 🐉 만약 드래곤(7번 보스) 등급이라면 위엄을 위해 크기를 1.5배 크게 그리는 연출 추가 가능!
 					if (obj.visual_id == 7) {
 						Ellipse(memDC, drawX - (radius + 6), drawY - (radius + 6), drawX + (radius + 6), drawY + (radius + 6));
 					}
@@ -934,43 +953,68 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 					}
 
 					SelectObject(memDC, hOldBrush);
-					DeleteObject(hBrush);;
+					DeleteObject(hBrush);
+
+					// ⭐ [기능 2] 몬스터 및 플레이어 머리 위에 체력 바(HP Bar) 직관적 렌더링
+					// 개체 위쪽에 가로 40픽셀, 세로 5픽셀 크기로 배치
+					if (obj.max_hp > 0) {
+						int hpBarWidth = 40;
+						int hpBarHeight = 5;
+						int hpBarX = drawX - (hpBarWidth / 2);
+						int hpBarY = drawY - radius - 24; // 이름표보다 위쪽에 정렬
+
+						// 1. 체력바 배경 (회색 빈 통)
+						RECT rcHpBg = { hpBarX, hpBarY, hpBarX + hpBarWidth, hpBarY + hpBarHeight };
+						HBRUSH hBrushBg = CreateSolidBrush(RGB(180, 180, 180));
+						FillRect(memDC, &rcHpBg, hBrushBg);
+						DeleteObject(hBrushBg);
+
+						// 2. 현재 잔여 체력 비율 계산 후 실시간 전방 바 (초록색) 채우기
+						float hpRatio = static_cast<float>(obj.hp) / static_cast<float>(obj.max_hp);
+						if (hpRatio < 0.0f) hpRatio = 0.0f;
+						int currentHpWidth = static_cast<int>(hpBarWidth * hpRatio);
+
+						RECT rcHpGauge = { hpBarX, hpBarY, hpBarX + currentHpWidth, hpBarY + hpBarHeight };
+						HBRUSH hBrushGauge = CreateSolidBrush(RGB(0, 220, 50));
+						FillRect(memDC, &rcHpGauge, hBrushGauge);
+						DeleteObject(hBrushGauge);
+					}
+
+					// 이름표 렌더링 위치 조정 (체력바 아래, 오브젝트 위)
+					TextOutA(memDC, drawX - 20, drawY - radius - 16, obj.username, (int)strlen(obj.username));
+
+					// 어택 이펙트 드로잉 파트
 					DWORD currentTime = GetTickCount();
-					// ⭐ [변경됨] 내가 아니더라도, 150ms 내에 공격한 '모든' 캐릭터에 이펙트 그리기
 					if (currentTime - obj.last_attack_time < ATTACK_EFFECT_DURATION) {
-						HPEN effectPen = CreatePen(PS_SOLID, 3, RGB(255, 165, 0)); // 주황색 테두리 펜
+						HPEN effectPen = CreatePen(PS_SOLID, 3, RGB(255, 165, 0));
 						HPEN oldPen = (HPEN)SelectObject(memDC, effectPen);
 
-						// 네모 속을 투명하게 칠하기 위해 NULL_BRUSH 사용
 						HBRUSH transparentBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
 						HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, transparentBrush);
 
 						int max_range = (obj.weapon == spear) ? 2 : 1;
 
-						// 타격 범위 시각화를 위한 이중 루프
 						for (int ey = -max_range; ey <= max_range; ++ey) {
 							for (int ex = -max_range; ex <= max_range; ++ex) {
 								bool is_hit_tile = false;
 
 								switch (obj.weapon) {
-								case hammer: // 십자 1칸
+								case hammer:
 									if (abs(ex) + abs(ey) <= 1) is_hit_tile = true;
 									break;
-								case spear:  // 주변 2칸
+								case spear:
 									if (max(abs(ex), abs(ey)) <= 2) is_hit_tile = true;
 									break;
-								case sword:  // 주변 1칸
-								default:     // ⭐ [해결!] 무기 정보가 쓰레기값이거나 아직 모를 땐 기본(검) 형태로 무조건 그리기!
+								case sword:
+								default:
 									if (max(abs(ex), abs(ey)) <= 1) is_hit_tile = true;
 									break;
 								}
 
 								if (is_hit_tile) {
-									// 이펙트를 그릴 타일의 중심 좌표 계산
 									int effectCenterX = drawX + (ex * TILE_SIZE);
 									int effectCenterY = drawY + (ey * TILE_SIZE);
 
-									// 해당 타일 크기만한 네모 테두리 그리기
 									Rectangle(memDC,
 										effectCenterX - TILE_SIZE / 2,
 										effectCenterY - TILE_SIZE / 2,
@@ -979,37 +1023,29 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 								}
 							}
 						}
-
-						// 자원 해제	
 						SelectObject(memDC, oldBrush);
 						SelectObject(memDC, oldPen);
 						DeleteObject(effectPen);
 					}
-
-					TextOutA(memDC, drawX - 15, drawY - (radius + 15), obj.username, (int)strlen(obj.username));
 				}
 			}
 
-			// --- [기능 3] 내 HUD 표시 (좌측 상단) ---
+			// HUD 및 기타 UI 컨텐츠 렌더링 유지
 			char hudText[256];
 			sprintf_s(hudText, "Name: %s (Lv.%d) | HP: %d/%d | Pos: (%d,%d) Gold: %dG",
 				myObj.username, myObj.level, myObj.hp, myObj.max_hp, myObj.x, myObj.y, myObj.gold);
 			TextOutA(memDC, 10, 10, hudText, (int)strlen(hudText));
 
-			// --- [기능 4] 타겟 Stat 창 표시 (우측 하단) ---
 			if (g_selected_target_id != -1 && g_objects.count(g_selected_target_id)) {
 				ClientObject& target = g_objects[g_selected_target_id];
-
 				RECT statRect = { width - 220, height - 150, width - 20, height - 20 };
 				FillRect(memDC, &statRect, (HBRUSH)GetStockObject(LTGRAY_BRUSH));
 
 				char statText[256];
 				sprintf_s(statText, "Target: %s\nLv: %d\nHP: %d/%d", target.username, target.level, target.hp, target.max_hp);
-
 				RECT textRect = statRect; textRect.left += 10; textRect.top += 10;
 				DrawTextA(memDC, statText, -1, &textRect, DT_LEFT);
 
-				// 파티 초대 버튼 (나 자신이 아니고, NPC도 아닐 때만 표시)
 				if (target.id != g_myid) {
 					g_rect_invite_btn = { statRect.left + 10, statRect.bottom - 40, statRect.right - 10, statRect.bottom - 10 };
 					FillRect(memDC, &g_rect_invite_btn, (HBRUSH)GetStockObject(WHITE_BRUSH));
@@ -1020,11 +1056,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 					g_rect_leave_btn = { statRect.left + 10, statRect.bottom - 40, statRect.right - 10, statRect.bottom - 10 };
 					FillRect(memDC, &g_rect_leave_btn, (HBRUSH)GetStockObject(WHITE_BRUSH));
 					DrawTextA(memDC, "파티 탈퇴", -1, &g_rect_leave_btn, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-					g_rect_invite_btn = { 0,0,0,0 }; // 안 그릴 때는 클릭 안되게 초기화
+					g_rect_invite_btn = { 0,0,0,0 };
 				}
 			}
 
-			// --- [기능 5] 강화 NPC UI 표시 (화면 중앙) ---
 			if (g_show_reinforce_ui) {
 				RECT uiRect = { CENTER_X - 150, CENTER_Y - 100, CENTER_X + 150, CENTER_Y + 100 };
 				FillRect(memDC, &uiRect, (HBRUSH)GetStockObject(GRAY_BRUSH));
@@ -1034,34 +1069,28 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				RECT textRect = uiRect; textRect.left += 20; textRect.top += 20;
 				DrawTextA(memDC, rnfText, -1, &textRect, DT_LEFT);
 
-				// 강화 시도 버튼
 				g_rect_reinforce_btn = { uiRect.left + 20, uiRect.bottom - 50, uiRect.left + 120, uiRect.bottom - 20 };
 				FillRect(memDC, &g_rect_reinforce_btn, (HBRUSH)GetStockObject(WHITE_BRUSH));
 				DrawTextA(memDC, "강화 시도", -1, &g_rect_reinforce_btn, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-				// 닫기 버튼
 				g_rect_close_reinforce_btn = { uiRect.right - 120, uiRect.bottom - 50, uiRect.right - 20, uiRect.bottom - 20 };
 				FillRect(memDC, &g_rect_close_reinforce_btn, (HBRUSH)GetStockObject(WHITE_BRUSH));
 				DrawTextA(memDC, "닫기", -1, &g_rect_close_reinforce_btn, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 			}
 
 			if (g_show_party_invite_popup) {
-				// 강화창과 겹치지 않게 약간 위쪽에 팝업 배치
 				RECT popRect = { CENTER_X - 150, CENTER_Y - 150, CENTER_X + 150, CENTER_Y + 10 };
 				FillRect(memDC, &popRect, (HBRUSH)GetStockObject(GRAY_BRUSH));
 
-				// 초대 문구 출력
 				char inviteText[256];
 				sprintf_s(inviteText, " 파티 초대 요청\n\n [%s] 님이\n 당신을 초대했습니다.\n\n 수락하시겠습니까?", g_inviter_name);
 				RECT textRect = popRect; textRect.left += 20; textRect.top += 15;
 				DrawTextA(memDC, inviteText, -1, &textRect, DT_LEFT);
 
-				// [수락] 버튼 영역 세팅 및 그리기
 				g_rect_party_accept_btn = { popRect.left + 20, popRect.bottom - 45, popRect.left + 130, popRect.bottom - 15 };
 				FillRect(memDC, &g_rect_party_accept_btn, (HBRUSH)GetStockObject(WHITE_BRUSH));
 				DrawTextA(memDC, "수락", -1, &g_rect_party_accept_btn, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-				// [거절] 버튼 영역 세팅 및 그리기
 				g_rect_party_refuse_btn = { popRect.right - 130, popRect.bottom - 45, popRect.right - 20, popRect.bottom - 15 };
 				FillRect(memDC, &g_rect_party_refuse_btn, (HBRUSH)GetStockObject(WHITE_BRUSH));
 				DrawTextA(memDC, "거절", -1, &g_rect_party_refuse_btn, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -1069,32 +1098,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 			if (g_party_member_count > 1) {
 				int startY = 40;
-
 				TextOutA(memDC, 10, startY, "=== PARTY MEMBERS ===", 21);
 				startY += 20;
 
 				for (int i = 0; i < g_party_member_count; ++i) {
-					if (g_party_members[i].id == g_myid) continue; // 나 자신은 제외
+					if (g_party_members[i].id == g_myid) continue;
 
 					char memberText[256];
-					// ⭐ 이름 (Lv.레벨) | HP: 현재 / 최대 구조로 출력
 					sprintf_s(memberText, "[파티원] %s (Lv.%d) | HP: %d/%d",
-						g_party_members[i].username,
-						g_party_members[i].level,
-						g_party_members[i].hp,
-						g_party_members[i].max_hp);
-
+						g_party_members[i].username, g_party_members[i].level, g_party_members[i].hp, g_party_members[i].max_hp);
 					TextOutA(memDC, 15, startY, memberText, (int)strlen(memberText));
 					startY += 20;
 				}
 			}
 		}
-		// --- 렌더링 끝 ---
 
-		// ⭐ [핵심 3] 완성된 메모리 도화지를 실제 모니터(hdc)로 고속 복사
 		BitBlt(hdc, 0, 0, width, height, memDC, 0, 0, SRCCOPY);
-
-		// 메모리 누수를 막기 위한 자원 반환 (매우 중요)
 		SelectObject(memDC, oldBitmap);
 		DeleteObject(memBitmap);
 		DeleteDC(memDC);

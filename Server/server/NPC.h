@@ -23,5 +23,7 @@ public:
 	short spawn_x; // 30초 후 부활을 위한 최초 스폰 위치 영구 보존 격자
 	short spawn_y;
 
+	int gold_reward; // 처치 시 골드 보상 (추가)
+
 	NPC(int id);
 };

@@ -11,7 +11,6 @@
 #pragma comment(lib, "MSWSock.lib")
 
 std::vector<std::vector<int>> g_map(WORLD_HEIGHT, std::vector<int>(WORLD_WIDTH, 0));
-
 Sector g_sectors[SECTOR_COUNT_Y][SECTOR_COUNT_X];
 
 struct event_type {
@@ -56,7 +55,7 @@ void PushPlayerSaveTask(int c_id) {
 
     {
         std::lock_guard<std::mutex> ll(pl->_lock);
-        if (pl->_state != ST_INGAME) return; // 로그인 완료된 유저만 세이브 허용
+        if (pl->_state != ST_INGAME) return;
         task.x = pl->x; task.y = pl->y;
         task.level = pl->stat.level; task.exp = pl->stat.exp;
         task.max_hp = pl->stat.max_hp;
@@ -131,7 +130,7 @@ void send_add_object_packet(int send_to_id, int add_obj_id) {
         auto pl = std::static_pointer_cast<Player>(add_obj);
         strcpy_s(p.obj_name, pl->_name);
         p.hp = pl->stat.hp; p.max_hp = pl->stat.max_hp; p.exp = pl->stat.exp; p.level = pl->stat.level;
-        p.visual_id = 0; // 0번은 일반 플레이어
+        p.visual_id = 0;
     }
     else {
         auto npc = std::static_pointer_cast<NPC>(add_obj);
@@ -139,9 +138,14 @@ void send_add_object_packet(int send_to_id, int add_obj_id) {
         p.hp = npc->stat.hp; p.max_hp = npc->stat.max_hp;
         p.level = npc->level; p.exp = 0;
 
-        // ⭐ [핵심 추가] 20만마리 초기화 배치 시 주입했던 1~7번 몬스터 종류 식별자를 전송!
-        // ID 규칙을 사용하여 슬라임(1), 고블린(2), 드래곤(7) 등을 구분합니다.
-        p.visual_id = (add_obj_id % 7) + 1;
+		int matched_visual_id = 0;
+        for (size_t t = 0; t < MonsterTemplates.size(); ++t) {
+            if (MonsterTemplates[t].name == npc->name) {
+                matched_visual_id = static_cast<int>(t) + 1;
+                break;
+            }
+        }
+        p.visual_id = matched_visual_id;
     }
     send_packet_to_player(send_to_id, &p);
 }
@@ -188,7 +192,6 @@ void send_dungeon_result(int send_to_id, DUNGEON_TYPE dungeon, bool success, sho
     S2C_DungeonResult p;
     p.size = sizeof(S2C_DungeonResult);
     p.type = S2C_DUNGEON_RESULT;
-    int playerId = send_to_id;
     p.dungeon = dungeon; p.success = success; p.x = to_x; p.y = to_y;
     send_packet_to_player(send_to_id, &p);
 }
@@ -274,7 +277,6 @@ void send_attack_broadcast(int send_to_id, int attacker_id, WEAPON_TYPE weapon) 
     send_packet_to_player(send_to_id, &p);
 }
 
-// disconnect 함수 위치를 위로 올림
 void disconnect(int c_id) {
     auto session = g_sessions[c_id].load();
     auto obj = g_objects[c_id].load();
@@ -318,8 +320,6 @@ void process_packet(int c_id, unsigned char* packet) {
     switch (packet[1]) {
     case C2S_LOGIN: {
         C2S_Login* p = reinterpret_cast<C2S_Login*>(packet);
-
-        // 클라이언트가 보낸 문자열 이름을 내 캐릭터 세션 공간에 각인
         strncpy_s(pl->_name, p->username, MAX_NAME_LEN);
 
         {
@@ -327,24 +327,27 @@ void process_packet(int c_id, unsigned char* packet) {
             g_name_to_id[pl->_name] = c_id;
         }
 
-        // 💥 [해결] 유령 ID 조회 대신, 완벽히 세팅된 이름(username) 영수증을 던집니다!
         DB_Task task;
         task.type = TASK_LOGIN;
         task.client_id = c_id;
         task.username = p->username;
 
-		cout << "로그인 시도: " << p->username << " (ID 조회 없이 이름으로 바로)" << endl;
         g_db_mgr.PushTask(task);
         break;
     }
     case C2S_MOVE: {
         C2S_Move* p = reinterpret_cast<C2S_Move*>(packet);
+
+        // ⭐ [버그 수정 2] 좌표 가중 멀티스레드 보호를 위해 플레이어 락을 조기에 잠급니다.
+        lock_guard<mutex> move_lock(pl->_lock);
+
         pl->last_move_time = p->move_time;
         int old_sx = pl->x / SECTOR_SIZE; int old_sy = pl->y / SECTOR_SIZE;
 
         short nx = pl->x + p->x; short ny = pl->y + p->y;
         if (nx < 0) nx = 0; else if (nx >= WORLD_WIDTH) nx = WORLD_WIDTH - 1;
         if (ny < 0) ny = 0; else if (ny >= WORLD_HEIGHT) ny = WORLD_HEIGHT - 1;
+
         if (g_map[ny][nx] == 1) {
             nx = pl->x;
             ny = pl->y;
@@ -352,8 +355,14 @@ void process_packet(int c_id, unsigned char* packet) {
         pl->x = nx; pl->y = ny;
 
         int new_sx = pl->x / SECTOR_SIZE; int new_sy = pl->y / SECTOR_SIZE;
+
+        // ⭐ 안전 경계 보정 규칙 추가 (섹터 이탈 방지)
+        if (new_sx < 0) new_sx = 0; else if (new_sx >= SECTOR_COUNT_X) new_sx = SECTOR_COUNT_X - 1;
+        if (new_sy < 0) new_sy = 0; else if (new_sy >= SECTOR_COUNT_Y) new_sy = SECTOR_COUNT_Y - 1;
+
         if (old_sx != new_sx || old_sy != new_sy) {
-            g_sectors[old_sy][old_sx].players[c_id] = 0;
+            if (old_sx >= 0 && old_sx < SECTOR_COUNT_X && old_sy >= 0 && old_sy < SECTOR_COUNT_Y)
+                g_sectors[old_sy][old_sx].players[c_id] = 0;
             g_sectors[new_sy][new_sx].players[c_id] = 1;
         }
 
@@ -419,14 +428,12 @@ void process_packet(int c_id, unsigned char* packet) {
             send_attack_broadcast(v_id, c_id, pl->stat.weapon);
         }
 
-        
         int sx = pl->x / SECTOR_SIZE;
         int sy = pl->y / SECTOR_SIZE;
         unordered_set<int> hit_targets;
 
-		int damage = WeaponReinforceTable.at({ pl->stat.weapon, pl->stat.reinforce_level }).damage;
+        int damage = WeaponReinforceTable.at({ pl->stat.weapon, pl->stat.reinforce_level }).damage;
 
-        // 인접 섹터 순회
         for (int dy = -1; dy <= 1; ++dy) {
             for (int dx = -1; dx <= 1; ++dx) {
                 int nx = sx + dx; int ny = sy + dy;
@@ -445,16 +452,15 @@ void process_packet(int c_id, unsigned char* packet) {
 
                     bool is_hit = false;
 
-                    // ⭐ 기획하신 무기별 공격 범위 수학적 판정
                     switch (pl->stat.weapon) {
                     case sword:
-                        if (max(dist_x, dist_y) <= 1) is_hit = true; // 주변 1칸 (대각선 포함)
+                        if (max(dist_x, dist_y) <= 1) is_hit = true;
                         break;
                     case hammer:
-                        if (dist_x + dist_y <= 1) is_hit = true;     // 십자 1칸 (상하좌우)
+                        if (dist_x + dist_y <= 1) is_hit = true;
                         break;
                     case spear:
-                        if (max(dist_x, dist_y) <= 2) is_hit = true; // 주변 2칸 (대각선 포함)
+                        if (max(dist_x, dist_y) <= 2) is_hit = true;
                         break;
                     }
 
@@ -478,68 +484,87 @@ void process_packet(int c_id, unsigned char* packet) {
                 new_hp = t_pl->stat.hp; t_max_hp = t_pl->stat.max_hp; t_level = t_pl->stat.level; t_exp = t_pl->stat.exp;
             }
             else {
-                // 몬스터 타격 시
+                // 💥 몬스터(NPC) 타격 시 로직 정밀 보정
                 auto npc = std::static_pointer_cast<NPC>(t_obj);
                 lock_guard<mutex> ll(npc->_lock);
 
-                // 여기서는 임시 상수가 아닌 실제 몬스터 hp 기획 관리가 요구되므로 
-                // 기존 기호님 변수 체계를 확장해 임시 차감 적용 (기본 100 기준 배정)
-                // npc의 hp를 임시 변수 대신 들고 있을 공간이 필요함 (없을 시를 대비해 로컬에서 감소 확인 처리)
-                // 여기서는 판정을 위해 단순 처리 예시에서 사망 판정 유도
+                // ① 유저의 무기 데미지만큼 몬스터의 실시간 현재 체력을 차감합니다.
+                npc->stat.hp -= damage;
+                if (npc->stat.hp < 0) npc->stat.hp = 0;
 
-                bool is_monster_dead = true; // 테스트를 위해 1타 격침 판정 (기획에 맞게 보정 가능)
+                // ② 주변 유저들에게 이 몬스터의 체력이 깎였다는 상태 변화 패킷을 보냅니다.
+                // (이 코드가 있어야 몬스터 머리 위의 HP 바가 실시간으로 줄어듭니다!)
+                S2C_StatusChange mon_status_p;
+                mon_status_p.size = sizeof(S2C_StatusChange);
+                mon_status_p.type = S2C_STATUS_CHANGE;
+                mon_status_p.object_id = t_id;
+                mon_status_p.hp = npc->stat.hp;
+                mon_status_p.max_hp = npc->stat.max_hp;
+                mon_status_p.level = npc->level;
+                mon_status_p.exp = 0;
+
+                // 내 화면 및 주변 유저 시야에 실시간 체력 변화 브로드캐스트
+                send_packet_to_player(c_id, &mon_status_p);
+                pl->_vl_lock.lock(); auto my_view_for_mon = pl->_view_list; pl->_vl_lock.unlock();
+                for (auto v_id : my_view_for_mon) {
+                    send_packet_to_player(v_id, &mon_status_p);
+                }
+
+                // ③ 실제 체력이 0이 되었을 때만 사망 판정을 내립니다!
+                bool is_monster_dead = (npc->stat.hp <= 0);
 
                 if (is_monster_dead) {
-                    npc->_state = ST_FREE; // 사망 처리로 월드에서 제외
+                    npc->_state = ST_FREE;
                     g_sectors[npc->y / SECTOR_SIZE][npc->x / SECTOR_SIZE].players[t_id] = 0;
 
-                    // 1️⃣ [기획서 공식 경험치 보상 연산]
-                    unsigned long long reward_exp = npc->level * npc->level * 2; // 공식: 레벨 * 레벨 * 2
+                    unsigned long long reward_exp = npc->level * npc->level * 2;
 
-                    // 보너스 조건: Agro 몬스터 2배, 로밍 몬스터 2배 배율 중첩 적용 (총 4배 가능)
                     if (npc->ai_type == "Agro") { reward_exp *= 2; }
                     if (npc->move_type == "로밍") { reward_exp *= 2; }
 
                     pl->stat.exp += reward_exp;
+                    pl->stat.gold += npc->gold_reward;
                     send_chat_message(c_id, "💥 몬스터를 처치하여 경험치를 획득했습니다!");
 
-                    // 2️⃣ [작성하신 LevelMaxHpTable 기반 레벨업 연산]
-                    // 경험치를 한 번에 많이 먹어 연속 레벨업을 할 수 있으므로 while 문으로 체크합니다.
-                    // 최대 레벨은 테이블 크기인 50레벨로 제한합니다.
+                    // 경험치 초기화/차감형 레벨업 루프 가동
+                    bool leveled_up = false;
                     while (pl->stat.level < 50) {
-                        // 다음 레벨업에 필요한 기준 누적 경험치 조회
-                        unsigned long long next_level_required_exp = LevelMaxHpTable[pl->stat.level].exp;
+                        unsigned long long required_exp = LevelMaxHpTable[pl->stat.level].exp;
 
-                        if (pl->stat.exp >= next_level_required_exp) {
-                            pl->stat.level++; // 레벨 업!
-
-                            // 테이블에 정의된 레벨별 최대 HP를 유저 스탯에 안전하게 동기화
-                            pl->stat.max_hp = LevelMaxHpTable[pl->stat.level].max_hp;
-                            pl->stat.hp = pl->stat.max_hp; // 레벨업 시 풀피 보너스
-
-                            send_chat_message(c_id, "🎉 축하합니다! 레벨이 상승했습니다!");
+                        if (pl->stat.exp >= required_exp) {
+                            pl->stat.exp -= required_exp;
+                            pl->stat.level++;
+                            leveled_up = true;
                         }
                         else {
                             break;
                         }
                     }
 
-                    // 최신 스탯 정보 패킷 전송
+                    if (leveled_up) {
+                        pl->stat.max_hp = LevelMaxHpTable[pl->stat.level].max_hp;
+                        pl->stat.hp = pl->stat.max_hp;
+                        send_chat_message(c_id, "🎉 축하합니다! 레벨이 상승했습니다!");
+                    }
+
                     send_status_change(c_id, pl->stat.hp, pl->stat.max_hp, pl->stat.exp, pl->stat.level);
-                    send_remove_object_packet(c_id, t_id); // 내 화면에서 삭제
+                    send_remove_object_packet(c_id, t_id);
 
-                    // 주변 유저 시야 동기화
                     pl->_vl_lock.lock(); auto my_view = pl->_view_list; pl->_vl_lock.unlock();
-                    for (auto v_id : my_view) send_remove_object_packet(v_id, t_id);
+                    for (auto v_id : my_view) {
+                        send_remove_object_packet(v_id, t_id);
+                        send_status_change(v_id, pl->stat.hp, pl->stat.max_hp, pl->stat.exp, pl->stat.level);
+                    }
 
-                    // 30초 후 부활 타이머 등록
+                    // 30초 후 리스폰 등록
                     event_type respawn_ev;
                     respawn_ev.obj_id = t_id;
                     respawn_ev.event_id = EVENT_RESPAWN;
-                    respawn_ev.wakeup_time = system_clock::now() + milliseconds(30000); // 30초
+                    respawn_ev.wakeup_time = system_clock::now() + milliseconds(30000);
                     timer_queue.push(respawn_ev);
-                    continue;
                 }
+                // 아직 살아있다면 다음 타겟팅 연산을 위해 계속 루프 진행
+                continue;
             }
 
             S2C_StatusChange status_p;
@@ -559,7 +584,6 @@ void process_packet(int c_id, unsigned char* packet) {
         int old_sx = pl->x / SECTOR_SIZE; int old_sy = pl->y / SECTOR_SIZE;
         pl->x = p->x; pl->y = p->y;
 
-        // 섹터 범위 보정
         if (pl->x < 0) pl->x = 0; else if (pl->x >= WORLD_WIDTH) pl->x = WORLD_WIDTH - 1;
         if (pl->y < 0) pl->y = 0; else if (pl->y >= WORLD_HEIGHT) pl->y = WORLD_HEIGHT - 1;
 
@@ -624,7 +648,7 @@ void process_packet(int c_id, unsigned char* packet) {
         lock_guard<mutex> ll(pl->_lock);
         pl->stat.weapon = p->weapon;
         send_info_result(c_id, c_id, 0, pl->_name, pl->x, pl->y, pl->stat.weapon, pl->stat.hp, pl->stat.max_hp,
-			pl->stat.gold, pl->stat.reinforce_level, pl->stat.exp, pl->stat.level, false);
+            pl->stat.gold, pl->stat.reinforce_level, pl->stat.exp, pl->stat.level, false);
         break;
     }
     case C2S_REQUEST_INFO: {
@@ -641,7 +665,6 @@ void process_packet(int c_id, unsigned char* packet) {
             if (other_obj && other_obj->is_pc() && other_obj->_state == ST_INGAME) {
                 auto other_pl = std::static_pointer_cast<Player>(other_obj);
                 lock_guard<mutex> ll(other_pl->_lock);
-                int current_gold = 1000;
                 bool in_party = (other_pl->stat.party_id != 0);
                 send_info_result(c_id, target_id, 0, other_pl->_name, other_pl->x, other_pl->y,
                     other_pl->stat.weapon, other_pl->stat.hp, other_pl->stat.max_hp,
@@ -655,8 +678,6 @@ void process_packet(int c_id, unsigned char* packet) {
         break;
     }
     case C2S_DUNGEON_ENTRY: {
-        // ⭐ [핵심 변경] 클라가 보내준 데이터에 의존하지 않고, 
-        // 현재 플레이어가 서 있는 '서버 좌표'를 기준으로 어떤 포탈인지 역추적합니다.
         const PortalInfo* current_portal = nullptr;
         for (const auto& portal : Portals) {
             if (pl->x == portal.src_x && pl->y == portal.src_y) {
@@ -665,12 +686,10 @@ void process_packet(int c_id, unsigned char* packet) {
             }
         }
 
-        // 포탈이 없는 맨땅에서 스페이스바를 누른 경우 무시 처리
         if (current_portal == nullptr) {
             break;
         }
 
-        // 1. 레벨 제한 검사
         if (pl->stat.level < current_portal->required_level) {
             char err_msg[256];
             sprintf_s(err_msg, "던전 입장 레벨이 부족합니다. (필요 레벨: %d)", current_portal->required_level);
@@ -679,11 +698,9 @@ void process_packet(int c_id, unsigned char* packet) {
             break;
         }
 
-        // 2. 진입 조건 통과: 목적지 좌표 설정
         short to_x = 0;
         short to_y = 0;
 
-        // 파이널 보스방 처리 (6x6 격자 던전 배정)
         if (current_portal->dungeon == FINAL_BOSS) {
             int allocated_x = -1;
             int allocated_y = -1;
@@ -709,23 +726,17 @@ void process_packet(int c_id, unsigned char* packet) {
                 break;
             }
 
-            // 보스방 격자 물리 좌표 계산 (간격 110)
             to_x = START_ROOM_X + (allocated_x * GRID_STEP);
             to_y = START_ROOM_Y - (allocated_y * GRID_STEP);
-
-            // 1:1 보스 몬스터 동적 생성 및 스폰
-            
 
             send_chat_message(c_id, "파이널 보스 전장에 입장했습니다! 스페이스바 상호작용 성공!");
         }
         else {
-            // 일반 던전 1~7번 이동
             to_x = current_portal->dest_x;
             to_y = current_portal->dest_y;
             send_chat_message(c_id, "던전에 입장했습니다.");
         }
 
-        // 3. 성공 결과 브로드캐스트 및 실제 텔레포트 이동 처리
         send_dungeon_result(c_id, current_portal->dungeon, true, to_x, to_y);
 
         C2S_Teleport tp;
@@ -776,30 +787,24 @@ void process_packet(int c_id, unsigned char* packet) {
         C2S_Reinforce* p = reinterpret_cast<C2S_Reinforce*>(packet);
         lock_guard<mutex> ll(pl->_lock);
 
-        // 1. 현재 내 무기 타입과 강화도에 맞는 데이터가 테이블에 있는지 조회
         auto key = std::make_pair(pl->stat.weapon, static_cast<short>(pl->stat.reinforce_level));
         auto it = WeaponReinforceTable.find(key);
 
-        // 만약 만렙 강화를 찍었거나 없는 무기 정보라면 차단
         if (it == WeaponReinforceTable.end()) {
             send_chat_message(c_id, "더 이상 강화할 수 없거나 잘못된 무기 정보입니다.");
             break;
         }
 
-        // ⭐ 테이블에서 비용, 확률 정보를 다이렉트로 꺼내옴!
         const ReinforceData& ref_info = it->second;
         int cost = ref_info.cost;
         float rate = ref_info.success_rate;
 
-        // TODO: 실제 유저 소지 골드 변수(pl->gold)로 연동
-		int current_gold = pl->stat.gold;
+        int current_gold = pl->stat.gold;
 
-        // 2. 골드 검증
         if (current_gold >= cost) {
-            current_gold -= cost; // 골드 차감
+            current_gold -= cost;
 
-            // 3. 테이블에 적힌 확률로 정확하게 판정 (0.0 ~ 100.0f 기준)
-            float random_value = static_cast<float>(rand() % 1000) / 10.0f; // 0.0 ~ 99.9
+            float random_value = static_cast<float>(rand() % 1000) / 10.0f;
             bool success = (random_value < rate);
 
             if (success) {
@@ -831,7 +836,7 @@ void process_packet(int c_id, unsigned char* packet) {
 
         if (target_id != -1 && target_id != c_id) {
             auto target_pl = std::static_pointer_cast<Player>(g_objects[target_id].load());
-            target_pl->stat.invited_by = c_id; // 초대자 기록
+            target_pl->stat.invited_by = c_id;
             send_party_invite_notification(target_id, c_id);
             send_chat_message(c_id, "파티 초대를 보냈습니다.");
         }
@@ -853,26 +858,23 @@ void process_packet(int c_id, unsigned char* packet) {
         int inviter_id = pl->stat.invited_by;
         auto inviter_obj = g_objects[inviter_id].load();
 
-        // ⭐ [방어 코드 1] 초대한 유저가 접속해 있는지 검증
         if (!inviter_obj || !inviter_obj->is_pc() || inviter_obj->_state != ST_INGAME) {
             send_chat_message(c_id, "초대자가 게임에 없거나 접속이 끊겼습니다.");
-            pl->stat.invited_by = -1; // 초대장 소모
+            pl->stat.invited_by = -1;
             break;
         }
 
         auto inviter_pl = std::static_pointer_cast<Player>(inviter_obj);
-        pl->stat.invited_by = -1; // 초대장 소모
+        pl->stat.invited_by = -1;
 
         int target_party_id = 0;
         std::shared_ptr<Party> party = nullptr;
 
-        // ⭐ [방어 코드 2] g_parties_lock의 범위를 최소화하여 데드락 방지
         {
             std::lock_guard<std::mutex> lock(g_parties_lock);
 
             target_party_id = inviter_pl->stat.party_id;
 
-            // 초대한 사람이 아직 파티가 없다면 새 파티 생성
             if (target_party_id == 0) {
                 int new_party_id = g_party_id_gen++;
                 party = std::make_shared<Party>();
@@ -888,11 +890,10 @@ void process_packet(int c_id, unsigned char* packet) {
                     party = g_parties[target_party_id];
                 }
             }
-        } // 락 해제: g_parties_lock은 여기서 즉시 해제되어 안전합니다.
+        }
 
-        // 파티 객체가 정상적으로 확보되었을 때만 가입 절차 진행
         if (party) {
-            std::lock_guard<std::mutex> p_lock(party->p_lock); // 개별 파티 락만 독립적으로 획득
+            std::lock_guard<std::mutex> p_lock(party->p_lock);
             if (party->members.size() >= MAX_PARTY_SIZE) {
                 send_chat_message(c_id, "해당 파티의 인원이 꽉 찼습니다.");
             }
@@ -906,7 +907,6 @@ void process_packet(int c_id, unsigned char* packet) {
             send_chat_message(c_id, "파티를 생성하거나 찾을 수 없습니다.");
         }
 
-        // 가입 완료 후 파티원 전체에게 UI 업데이트 브로드캐스트
         if (pl->stat.party_id != 0) {
             broadcast_party_update(pl->stat.party_id);
         }
@@ -923,7 +923,7 @@ void process_packet(int c_id, unsigned char* packet) {
         }
 
         int my_party_id = pl->stat.party_id;
-        pl->stat.party_id = 0; // 내 파티 정보 초기화
+        pl->stat.party_id = 0;
 
         {
             std::lock_guard<std::mutex> lock(g_parties_lock);
@@ -931,24 +931,21 @@ void process_packet(int c_id, unsigned char* packet) {
                 auto party = g_parties[my_party_id];
                 std::lock_guard<std::mutex> p_lock(party->p_lock);
 
-                // 멤버 리스트에서 나를 제거
                 party->members.erase(std::remove(party->members.begin(), party->members.end(), c_id), party->members.end());
 
                 send_chat_message(c_id, "파티에서 탈퇴했습니다.");
 
                 if (party->members.empty()) {
-                    // 남은 인원이 없으면 파티 파괴
                     g_parties.erase(my_party_id);
                 }
             }
         }
 
-        // ⭐ [해결책] 탈퇴한 '나'에게 파티원이 0명이 되었다는 빈 패킷을 강제로 전송
         S2C_PartyUpdate empty_packet;
         empty_packet.size = sizeof(S2C_PartyUpdate);
         empty_packet.type = S2C_PARTY_UPDATE;
         empty_packet.playerId = c_id;
-        empty_packet.party_member_count = 0; // 0명으로 세팅
+        empty_packet.party_member_count = 0;
         send_packet_to_player(c_id, &empty_packet);
 
         if (g_parties.count(my_party_id)) {
@@ -1044,29 +1041,91 @@ void worker_thread(HANDLE h_iocp) {
         }
 
         switch (ex_over->_comp_type) {
-            // ... OP_ACCEPT / OP_RECV / OP_SEND 동일 유지 ...
-        case OP_RECV: { /* 기존 기호님 링버퍼 파싱 코드 그대로 유지 */ break; }
+        case OP_ACCEPT: {
+            int client_id = player_index_count++;
+            if (client_id < MAX_PLAYERS) {
+                auto new_sess = std::make_shared<Session>(client_id, g_c_socket);
+                g_sessions[client_id].store(new_sess);
+                auto new_pl = std::make_shared<Player>(client_id);
+                new_pl->_session = new_sess.get(); g_objects[client_id].store(new_pl);
+
+                CreateIoCompletionPort(reinterpret_cast<HANDLE>(g_c_socket), h_iocp, client_id, 0);
+                new_sess->do_recv();
+                g_c_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+            }
+            else {
+                closesocket(g_c_socket); g_c_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+            }
+            ZeroMemory(&g_a_over._over, sizeof(g_a_over._over));
+            int addr_size = sizeof(SOCKADDR_IN);
+            AcceptEx(g_s_socket, g_c_socket, g_a_over._send_buf, 0, addr_size + 16, addr_size + 16, NULL, &g_a_over._over);
+            break;
+        }
+        case OP_RECV: {
+            int c_id = static_cast<int>(key);
+            auto session = g_sessions[c_id].load();
+            if (!session) break;
+
+            session->_count += num_bytes;
+            session->_tail = (session->_tail + num_bytes) % RING_BUF_SIZE;
+
+            while (session->_count > 0) {
+                unsigned char packet_size = session->_recv_buf[session->_head];
+
+                if (packet_size == 0 || session->_count < packet_size) {
+                    break;
+                }
+
+                char complete_packet[BUF_SIZE];
+
+                if (session->_head + packet_size <= RING_BUF_SIZE) {
+                    memcpy(complete_packet, session->_recv_buf + session->_head, packet_size);
+                }
+                else {
+                    int part1_len = RING_BUF_SIZE - session->_head;
+                    int part2_len = packet_size - part1_len;
+                    memcpy(complete_packet, session->_recv_buf + session->_head, part1_len);
+                    memcpy(complete_packet + part1_len, session->_recv_buf, part2_len);
+                }
+
+                process_packet(c_id, reinterpret_cast<unsigned char*>(complete_packet));
+
+                session->_head = (session->_head + packet_size) % RING_BUF_SIZE;
+                session->_count -= packet_size;
+            }
+
+            session->do_recv();
+            break;
+        }
+        case OP_SEND: delete ex_over; break;
 
         case OP_NPCMOVE: {
             delete ex_over;
             int npc_id = static_cast<int>(key);
 
             auto obj = g_objects[npc_id].load();
-            if (!obj || obj->_state != ST_INGAME) break; // 죽은 몬스터는 AI 동작 차단
+            if (!obj || obj->_state != ST_INGAME) break;
             auto npc = std::static_pointer_cast<NPC>(obj);
 
             int target_player_id = -1;
             bool has_nearby_player = false;
             int sx = npc->x / SECTOR_SIZE; int sy = npc->y / SECTOR_SIZE;
 
-            // 시야 검사 반경 11x11 타일(내 주변 상하좌우 5칸 격자 추적 탐색)
+            // 섹터 범위 예외 안전망
+            if (sx < 0 || sx >= SECTOR_COUNT_X || sy < 0 || sy >= SECTOR_COUNT_Y) break;
+
             for (int dy = -1; dy <= 1 && !has_nearby_player; ++dy) {
                 for (int dx = -1; dx <= 1 && !has_nearby_player; ++dx) {
                     int nx = sx + dx; int ny = sy + dy;
                     if (nx < 0 || nx >= SECTOR_COUNT_X || ny < 0 || ny >= SECTOR_COUNT_Y) continue;
                     for (auto& sec_pl : g_sectors[ny][nx].players) {
                         if (sec_pl.second == 0) continue;
-                        int p_id = sec_pl.first; auto other = g_objects[p_id].load();
+                        int p_id = sec_pl.first;
+
+                        // 진짜 유저(0 ~ MAX_PLAYERS) 범위만 필터링
+                        if (p_id < 0 || p_id >= MAX_PLAYERS) continue;
+
+                        auto other = g_objects[p_id].load();
                         if (other && other->is_pc() && other->_state == ST_INGAME && can_see(npc_id, p_id)) {
                             target_player_id = p_id;
                             has_nearby_player = true;
@@ -1076,20 +1135,24 @@ void worker_thread(HANDLE h_iocp) {
                 }
             }
 
+            // 진짜 타겟 유저가 있거나, 타겟은 없지만 평화 상태의 로밍/고정 이동 규칙을 수행해야 할 때 가동
             g_lua_mgr.RunAI(npc_id, target_player_id);
 
+            // 계속 유저가 감지된다면 무한 루프 과부하 방지를 위해 1초(MOVE_COOL_TIME) 딜레이 뒤 다시 알람을 주도록 세팅
             if (has_nearby_player) {
                 event_type ev; ev.event_id = EVENT_MOVE; ev.obj_id = npc_id; ev.target_id = -1;
-                ev.wakeup_time = system_clock::now() + milliseconds(MOVE_COOL_TIME); timer_queue.push(ev);
+                ev.wakeup_time = system_clock::now() + milliseconds(MOVE_COOL_TIME);
+                timer_queue.push(ev);
             }
-            else { npc->_active_npc = false; }
+            else {
+                npc->_active_npc = false;
+            }
             break;
         }
         }
     }
 }
 
-// timer_thread 수정본 (부활 연동)
 void timer_thread() {
     while (true) {
         event_type ev;
@@ -1100,13 +1163,12 @@ void timer_thread() {
                     PostQueuedCompletionStatus(h_iocp, -1, ev.obj_id, &move_over->_over);
                 }
                 else if (ev.event_id == EVENT_RESPAWN) {
-                    // ⭐ [30초 후 부활 처리 비동기 구현]
                     auto obj = g_objects[ev.obj_id].load();
                     if (obj) {
                         auto npc = std::static_pointer_cast<NPC>(obj);
                         npc->x = npc->spawn_x;
                         npc->y = npc->spawn_y;
-                        npc->_state = ST_INGAME; // 기상!
+                        npc->_state = ST_INGAME;
                         npc->_active_npc = false;
                         g_sectors[npc->y / SECTOR_SIZE][npc->x / SECTOR_SIZE].players[ev.obj_id] = 1;
                         std::cout << "[부활 알림] 몬스터 " << ev.obj_id << "번이 지정 좌표에 리스폰되었습니다." << std::endl;
@@ -1124,39 +1186,40 @@ void InitPlayerFromDB(int c_id, std::string name, const DB_Task& data) {
     if (!obj || !obj->is_pc()) return;
     auto pl = std::static_pointer_cast<Player>(obj);
 
-    // ⭐ 락을 잠그고 안전하게 세이브 파일 정보를 메모리에 대입
     {
         std::lock_guard<std::mutex> ll{ pl->_lock };
         pl->x = data.x;
         pl->y = data.y;
         pl->stat.level = data.level;
         pl->stat.exp = data.exp;
-		pl->stat.hp = data.max_hp;
+        pl->stat.hp = data.max_hp;
         pl->stat.max_hp = data.max_hp;
         pl->stat.weapon = data.weapon;
         pl->stat.reinforce_level = data.reinforce_level;
-		pl->stat.gold = data.gold;
+        pl->stat.gold = data.gold;
 
-        pl->_state = ST_INGAME; // 💥 이제 완벽히 게임 월드 라이브 상태로 승격!
+        pl->_state = ST_INGAME;
     }
 
     int sx = pl->x / SECTOR_SIZE;
     int sy = pl->y / SECTOR_SIZE;
     g_sectors[sy][sx].players[c_id] = 1;
 
-    // 클라이언트에 기분 좋은 로드 성공 소식을 전송
     S2C_AvatarInfo info;
     info.size = sizeof(S2C_AvatarInfo);
     info.type = S2C_AVATAR_INFO;
     info.playerId = c_id;
-    info.visualId = player;
+
+    // ⭐ [버그 수정 3] 하드코딩된 대문자 'player'는 컴파일 에러 유발 요소이므로 
+    // 실제 DB에서 복구해낸 무기 타입 번호로 정확하게 채워줍니다.
+    info.visualId = static_cast<int>(data.weapon);
+
     strcpy_s(info.username, pl->_name);
     info.x = pl->x; info.y = pl->y;
     info.hp = pl->stat.hp; info.max_hp = pl->stat.max_hp;
     info.level = pl->stat.level; info.exp = pl->stat.exp;
     send_packet_to_player(c_id, &info);
 
-    // 주변 시야 동기화 
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             int nx = sx + dx; int ny = sy + dy;
@@ -1188,7 +1251,7 @@ int main() {
     WSADATA WSAData; WSAStartup(MAKEWORD(2, 2), &WSAData);
 
     if (!g_db_mgr.Initialize()) {
-        std::cout << "MS-SQL (2022182002_gsp) 연결 엔진 초기화 실패! 구동을 차단합니다." << std::endl;
+        std::cout << "MS-SQL 연결 엔진 초기화 실패! 구동을 차단합니다." << std::endl;
         return 0;
     }
 
@@ -1204,48 +1267,71 @@ int main() {
 
     LoadMapCSV("..\\..\\Resource\\world.csv");
 
-    std::cout << "NPC 스크립트 정밀 안전 배치 시작 (20만 마리)...\n";
+    std::cout << "데이터 테이블 기반 사냥터 구역별 NPC 배치 시작 (20만 마리)...\n";
+
     int spawned_count = 0;
-    size_t template_count = MonsterTemplates.size();
 
-    while (spawned_count < NUM_NPCS) {
-        int i = MAX_PLAYERS + spawned_count;
-        auto new_npc = std::make_shared<NPC>(i);
+    // 20만 마리를 7개의 사냥터 구역에 똑같이 분배 (구역당 약 28,571마리씩)
+    const int NPCS_PER_ZONE = NUM_NPCS / 7;
 
-        int rx = rand() % WORLD_WIDTH;
-        int ry = rand() % WORLD_HEIGHT;
+    // 사냥터 구역 테이블(HuntingZoneTable)을 하나씩 순회
+    for (const auto& zone : HuntingZoneTable) {
+        std::cout << "▶ [" << zone.zone_name << "] 지역 배치 시작... (템플릿: "
+            << MonsterTemplates[zone.template_index].name << ")\n";
 
-        // 💥 [핵심 안전망] world.csv 맵을 대조하여 벽(1) 위에는 스폰을 차단합니다.
-        if (g_map[ry][rx] == 1) {
-            continue;
+        // 구역 내부 가로세로 폭 계산
+        int zone_width = zone.max_x - zone.min_x;
+        int zone_height = zone.max_y - zone.min_y;
+
+        int zone_spawned = 0;
+        while (zone_spawned < NPCS_PER_ZONE) {
+            int i = MAX_PLAYERS + spawned_count;
+            auto new_npc = std::make_shared<NPC>(i);
+
+            // 💥 [테이블 연동] 각 사냥터 테이블에 정의된 최소~최대 범위 안에서만 랜덤 좌표를 뽑아냅니다!
+            int rx = zone.min_x + (rand() % zone_width);
+            int ry = zone.min_y + (rand() % zone_height);
+
+            // 월드 오버플로우 방지 및 보정
+            if (rx >= WORLD_WIDTH)  rx = WORLD_WIDTH - 1;
+            if (ry >= WORLD_HEIGHT) ry = WORLD_HEIGHT - 1;
+
+            // world.csv 맵 파일과 대조해서 벽(1) 위에는 스폰을 완벽 차단합니다
+            if (g_map[ry][rx] == 1) {
+                continue;
+            }
+
+            // 몬스터 종류 템플릿 가져오기
+            const auto& meta = MonsterTemplates[zone.template_index];
+
+            // NPC 객체 메모리에 데이터 주입
+            new_npc->x = rx;
+            new_npc->y = ry;
+            new_npc->spawn_x = rx;
+            new_npc->spawn_y = ry;
+
+            new_npc->name = meta.name;
+            new_npc->level = meta.level;
+            new_npc->stat.hp = meta.max_hp;
+            new_npc->stat.max_hp = meta.max_hp;
+            new_npc->stat.damage = meta.damage;
+            new_npc->ai_type = meta.ai_type;
+            new_npc->move_type = meta.move_type;
+			new_npc->gold_reward = meta.gold_reward;
+
+            new_npc->_state = ST_INGAME;
+            g_objects[i].store(new_npc);
+            g_sectors[ry / SECTOR_SIZE][rx / SECTOR_SIZE].players[i] = 1;
+
+            zone_spawned++;
+            spawned_count++;
+
+            if (spawned_count >= NUM_NPCS) break;
         }
-
-        // 몬스터 종류를 20만 마리에 골고루 분배 (슬라임부터 드래곤까지 순차적 분배)
-        const auto& meta = MonsterTemplates[spawned_count % template_count];
-
-        // 구조체 속성 대입
-        new_npc->x = rx;
-        new_npc->y = ry;
-        new_npc->spawn_x = rx; // 30초 후 리스폰을 위한 최초 좌표 보존
-        new_npc->spawn_y = ry;
-
-        // 💥 기획서 데이터 테이블 기반 스탯 주입
-        new_npc->name = meta.name;
-        new_npc->level = meta.level;
-        new_npc->stat.hp = meta.max_hp;      // NPC 클래스 내부 구조에 맞게 변수명 대조 필요
-        new_npc->stat.max_hp = meta.max_hp;
-        new_npc->stat.damage = meta.damage;  // 몬스터 데미지 테이블 연동
-        new_npc->ai_type = meta.ai_type;
-        new_npc->move_type = meta.move_type;
-
-        new_npc->_state = ST_INGAME;
-        g_objects[i].store(new_npc);
-        g_sectors[ry / SECTOR_SIZE][rx / SECTOR_SIZE].players[i] = 1;
-
-        spawned_count++;
     }
-    std::cout << "벽 충돌 우회 및 도감 데이터 주입 완료: 총 " << spawned_count << "마리 배치 완료.\n";
+    std::cout << "물리 테이블 기준 20만 마리 구역 분할 기획 배치 완료!\n";
 
+    h_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 0);
     h_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 0);
     CreateIoCompletionPort(reinterpret_cast<HANDLE>(g_s_socket), h_iocp, 9999, 0);
 

@@ -20,10 +20,8 @@ extern void send_move_object_packet(int send_to_id, int move_obj_id);
 extern void send_status_change(int send_to_id, int hp, int max_hp, unsigned long long exp, unsigned char level);
 
 LuaManager g_lua_mgr;
+std::mutex g_lua_lock;
 
-// =================================================================
-// 🧭 고성능 A* 알고리즘 엔진 구현 (world.csv 벽 회피용)
-// =================================================================
 struct AStarNode {
     int x, y;
     int g, h, f;
@@ -39,15 +37,18 @@ struct CompareNode {
 
 std::pair<int, int> CalcAStarNextStep(int start_x, int start_y, int dest_x, int dest_y) {
     if (dest_x < 0 || dest_x >= WORLD_WIDTH || dest_y < 0 || dest_y >= WORLD_HEIGHT) return { start_x, start_y };
-    if (g_map[dest_y][dest_x] == 1) return { start_x, start_y }; // 목적지가 벽
+    if (g_map[dest_y][dest_x] == 1) return { start_x, start_y };
 
-    std::priority_queue<AStarNode*, std::vector<AStarNode*>, CompareNode> open_set;
-
-    // 부하 방지를 위해 시야 반경(최대 10칸)으로 길찾기 타일 영역 제한
+    // 시야 탐색 영역 제한 계산
     int min_x = max(0, start_x - 10), max_x = min(WORLD_WIDTH - 1, start_x + 10);
     int min_y = max(0, start_y - 10), max_y = min(WORLD_HEIGHT - 1, start_y + 10);
 
-    std::vector<std::vector<bool>> closed_set(WORLD_HEIGHT, std::vector<bool>(WORLD_WIDTH, false));
+    // 💥 [메모리 다이어트] 2000x2000(4백만 칸) 대신 딱 필요한 시야 영역 격자(최대 21x21 = 441칸)만 잡습니다.
+    int range_x = max_x - min_x + 1;
+    int range_y = max_y - min_y + 1;
+    std::vector<std::vector<bool>> closed_set(range_y, std::vector<bool>(range_x, false));
+
+    std::priority_queue<AStarNode*, std::vector<AStarNode*>, CompareNode> open_set;
     open_set.push(new AStarNode(start_x, start_y, 0, abs(start_x - dest_x) + abs(start_y - dest_y)));
 
     int dx[] = { 0, 0, -1, 1 }; int dy[] = { -1, 1, 0, 0 };
@@ -57,12 +58,14 @@ std::pair<int, int> CalcAStarNextStep(int start_x, int start_y, int dest_x, int 
         AStarNode* curr = open_set.top(); open_set.pop();
 
         if (curr->x == dest_x && curr->y == dest_y) { end_node = curr; break; }
-        closed_set[curr->y][curr->x] = true;
+
+        // 상대 좌표 인덱싱으로 가볍게 매핑
+        closed_set[curr->y - min_y][curr->x - min_x] = true;
 
         for (int i = 0; i < 4; ++i) {
             int nx = curr->x + dx[i]; int ny = curr->y + dy[i];
             if (nx < min_x || nx > max_x || ny < min_y || ny > max_y) continue;
-            if (g_map[ny][nx] == 1 || closed_set[ny][nx]) continue; // 벽(1) 충돌 무시
+            if (g_map[ny][nx] == 1 || closed_set[ny - min_y][nx - min_x]) continue;
 
             int next_g = curr->g + 1;
             int next_h = abs(nx - dest_x) + abs(ny - dest_y);
@@ -141,12 +144,25 @@ void MoveMonsterToGrid(std::shared_ptr<NPC>& npc, int next_x, int next_y, int mo
 
 int API_GetObjPos(lua_State* L) {
     int obj_id = (int)lua_tonumber(L, 1);
-    auto obj = g_objects[obj_id].load();
-    if (obj && obj->_state == ST_INGAME) {
-        lua_pushnumber(L, obj->x); lua_pushnumber(L, obj->y);
+
+    // 💥 [안전장치] 만약 g_objects에 없는 가짜 ID거나 세션이 비어있다면 루아가 터지지 않게 방어
+    if (g_objects.count(obj_id) == 0) {
+        lua_pushnumber(L, -1);
+        lua_pushnumber(L, -1);
         return 2;
     }
-    return 0;
+
+    auto obj = g_objects[obj_id].load();
+    if (obj && obj->_state == ST_INGAME) {
+        lua_pushnumber(L, obj->x);
+        lua_pushnumber(L, obj->y);
+        return 2;
+    }
+
+    // 오브젝트는 있으나 인게임 상태가 아닐 때도 안전값 리턴
+    lua_pushnumber(L, -1);
+    lua_pushnumber(L, -1);
+    return 2;
 }
 
 int API_MoveTowards(lua_State* L) {
@@ -261,8 +277,13 @@ bool LuaManager::Initialize() {
 
 void LuaManager::RunAI(int monster_id, int target_player_id) {
     if (!L) return;
+
+    // 💥 [멀티스레드 크래시 방지] IOCP 스레드들이 차례대로 순서를 지켜 루아를 호출하도록 제어합니다.
+    std::lock_guard<std::mutex> lock(g_lua_lock);
+
     lua_getglobal(L, "ProcessMonsterAI");
-    lua_pushnumber(L, monster_id); lua_pushnumber(L, target_player_id);
+    lua_pushnumber(L, monster_id);
+    lua_pushnumber(L, target_player_id);
 
     if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
         std::cout << "[Lua 런타임 오류] " << lua_tostring(L, -1) << std::endl;
