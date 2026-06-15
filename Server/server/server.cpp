@@ -5,6 +5,7 @@
 #include "NPC.h"
 #include "DB.h"
 #include "LuaManager.h"
+#include <concurrent_queue.h>
 
 #pragma comment(lib, "lua55.lib")
 #pragma comment(lib, "WS2_32.lib")
@@ -17,7 +18,9 @@ struct event_type {
     int obj_id; system_clock::time_point wakeup_time; int event_id; int target_id;
     constexpr bool operator < (const event_type& _Left) const { return (wakeup_time > _Left.wakeup_time); }
 };
-concurrency::concurrent_priority_queue<event_type> timer_queue;
+
+constexpr int NUM_TIMER_QUEUES = 16;
+concurrency::concurrent_priority_queue<event_type> timer_queues[NUM_TIMER_QUEUES];
 
 HANDLE h_iocp;
 SOCKET g_s_socket, g_c_socket;
@@ -44,25 +47,37 @@ std::mutex g_boss_room_lock;
 
 DBManager g_db_mgr;
 
-void PushPlayerSaveTask(int c_id) {
-    auto obj = g_objects[c_id].load();
-    if (!obj || !obj->is_pc()) return;
-    auto pl = std::static_pointer_cast<Player>(obj);
+concurrency::concurrent_queue<OVER_EXP*> over_pool;
+
+OVER_EXP* GetOverExp() {
+    OVER_EXP* over;
+    if (over_pool.try_pop(over)) {
+        ZeroMemory(&over->_over, sizeof(over->_over));
+        return over;
+    }
+    return new OVER_EXP();
+}
+
+void FreeOverExp(OVER_EXP* over) {
+    over_pool.push(over);
+}
+
+void PushPlayerSaveTask(std::shared_ptr<Player> pl) {
+    if (!pl || pl->_state != ST_INGAME) return;
 
     DB_Task task;
     task.type = TASK_SAVE;
-    task.username = pl->_name;
+    task.client_id = pl->_id;
+    task.username = std::string(pl->_name);
+    task.x = pl->x;
+    task.y = pl->y;
+    task.level = pl->stat.level;
+    task.exp = pl->stat.exp;
+    task.max_hp = pl->stat.max_hp;
+    task.gold = pl->stat.gold;
+    task.weapon = pl->stat.weapon;
+    task.reinforce_level = pl->stat.reinforce_level;
 
-    {
-        std::lock_guard<std::mutex> ll(pl->_lock);
-        if (pl->_state != ST_INGAME) return;
-        task.x = pl->x; task.y = pl->y;
-        task.level = pl->stat.level; task.exp = pl->stat.exp;
-        task.max_hp = pl->stat.max_hp;
-        task.gold = pl->stat.gold;
-        task.weapon = pl->stat.weapon;
-        task.reinforce_level = pl->stat.reinforce_level;
-    }
     g_db_mgr.PushTask(task);
 }
 
@@ -105,7 +120,7 @@ void wake_up_npc(int npc_id) {
 
     event_type ev; ev.obj_id = npc_id; ev.event_id = EVENT_MOVE; ev.target_id = -1;
     ev.wakeup_time = system_clock::now() + milliseconds(MOVE_COOL_TIME);
-    timer_queue.push(ev);
+    timer_queues[npc_id % NUM_TIMER_QUEUES].push(ev);
 }
 
 void send_packet_to_player(int target_client_id, void* packet) {
@@ -128,7 +143,7 @@ void send_add_object_packet(int send_to_id, int add_obj_id) {
 
     if (add_obj->is_pc()) {
         auto pl = std::static_pointer_cast<Player>(add_obj);
-        strcpy_s(p.obj_name, pl->_name);
+        strncpy_s(p.obj_name, pl->_name, _TRUNCATE);
         p.hp = pl->stat.hp; p.max_hp = pl->stat.max_hp; p.exp = pl->stat.exp; p.level = pl->stat.level;
         p.visual_id = 0;
     }
@@ -137,15 +152,7 @@ void send_add_object_packet(int send_to_id, int add_obj_id) {
         sprintf_s(p.obj_name, "%s", npc->name.c_str());
         p.hp = npc->stat.hp; p.max_hp = npc->stat.max_hp;
         p.level = npc->level; p.exp = 0;
-
-		int matched_visual_id = 0;
-        for (size_t t = 0; t < MonsterTemplates.size(); ++t) {
-            if (MonsterTemplates[t].name == npc->name) {
-                matched_visual_id = static_cast<int>(t) + 1;
-                break;
-            }
-        }
-        p.visual_id = matched_visual_id;
+        p.visual_id = npc->visual_id;
     }
     send_packet_to_player(send_to_id, &p);
 }
@@ -170,12 +177,12 @@ void send_move_object_packet(int send_to_id, int move_obj_id) {
     send_packet_to_player(send_to_id, &p);
 }
 
-void send_chat_message(int send_to_id, const char* message) {
+void send_chat_message(int send_to_id, const char* sender_name, const char* message) {
     S2C_ChatMessage p;
     p.size = sizeof(S2C_ChatMessage);
     p.type = S2C_CHAT_MESSAGE;
-    p.object_id = send_to_id;
-    strncpy_s(p.message, message, sizeof(p.message));
+    p.object_id = 0;
+    sprintf_s(p.message, sizeof(p.message), "[%s]: %s", sender_name, message);
     send_packet_to_player(send_to_id, &p);
 }
 
@@ -202,8 +209,15 @@ void send_info_result(int send_to_id, int playerId, int visualId, char* username
     p.size = sizeof(S2C_InfoResult);
     p.type = S2C_INFO_RESULT;
     p.playerId = playerId;
-    p.visualId = visualId; strncpy_s(p.username, username, MAX_NAME_LEN); p.x = x; p.y = y; p.weapon = weapon;
-    p.hp = hp; p.max_hp = max_hp; p.gold = gold; p.reinforce_level = reinforce_level; p.exp = exp; p.level = level; p.in_party = in_party;
+    p.visualId = visualId;
+    strncpy_s(p.username, sizeof(p.username), username, _TRUNCATE);
+    p.x = x; p.y = y;
+    p.weapon = weapon;
+    p.hp = hp; p.max_hp = max_hp;
+    p.gold = gold; p.reinforce_level = reinforce_level;
+    p.exp = exp; p.level = level;
+    p.in_party = in_party;
+
     send_packet_to_player(send_to_id, &p);
 }
 
@@ -212,7 +226,7 @@ void send_interact_result(int send_to_id, bool success, const char* message) {
     p.size = sizeof(S2C_InteractResult);
     p.type = S2C_INTERACT_RESULT;
     p.playerId = send_to_id;
-    p.success = success; strncpy_s(p.message, message, sizeof(p.message));
+    p.success = success; strncpy_s(p.message, sizeof(p.message), message, _TRUNCATE);
     send_packet_to_player(send_to_id, &p);
 }
 
@@ -277,14 +291,67 @@ void send_attack_broadcast(int send_to_id, int attacker_id, WEAPON_TYPE weapon) 
     send_packet_to_player(send_to_id, &p);
 }
 
+void send_system_message(int send_to_id, const char* message) {
+    S2C_ChatMessage p;
+    p.size = sizeof(S2C_ChatMessage);
+    p.type = S2C_CHAT_MESSAGE;
+    p.object_id = 0;
+    sprintf_s(p.message, sizeof(p.message), "[시스템] %s", message);
+    send_packet_to_player(send_to_id, &p);
+}
+
+void process_packet(int c_id, unsigned char* buffer);
+
 void disconnect(int c_id) {
     auto session = g_sessions[c_id].load();
     auto obj = g_objects[c_id].load();
 
     if (obj && obj->is_pc()) {
-        PushPlayerSaveTask(c_id);
         auto pl = std::static_pointer_cast<Player>(obj);
-        pl->_vl_lock.lock(); unordered_set<int> vl = pl->_view_list; pl->_vl_lock.unlock();
+
+        int room_x = (pl->x - ROOM_LEFT_X) / GRID_STEP;
+        int room_y = (ROOM_BOTTOM_Y - pl->y) / GRID_STEP;
+
+        if (room_x >= 0 && room_x < 6 && room_y >= 0 && room_y < 6) {
+            std::lock_guard<std::mutex> lock(g_boss_room_lock);
+
+            if (g_boss_rooms[room_y][room_x]) {
+
+                int p_id = pl->stat.party_id;
+                if (p_id != 0) {
+                    std::lock_guard<std::mutex> p_lock_main(g_parties_lock);
+                    if (g_parties.count(p_id)) {
+                        auto party = g_parties[p_id];
+                        std::lock_guard<std::mutex> plock(party->p_lock);
+
+                        for (int member_id : party->members) {
+                            if (member_id == c_id) continue;
+
+                            auto m_obj = g_objects[member_id].load();
+                            if (m_obj && m_obj->_state == ST_INGAME) {
+                                send_system_message(member_id, "파티원 중 일부가 이탈하여 보스 레이드가 강제 종료됩니다. 마을로 전원 귀환합니다.");
+
+                                C2S_Teleport tp;
+                                tp.size = sizeof(C2S_Teleport); tp.type = C2S_TELEPORT;
+                                tp.x = 1000; tp.y = 1000;
+                                process_packet(member_id, reinterpret_cast<unsigned char*>(&tp));
+                            }
+                        }
+                    }
+                }
+
+                int room_boss_id = NPC_ID_START + 100000 + (room_y * 6 + room_x);
+                auto b_obj = g_objects[room_boss_id].load();
+                if (b_obj) {
+                    b_obj->_state = ST_FREE;
+                    g_sectors[b_obj->y / SECTOR_SIZE][b_obj->x / SECTOR_SIZE].players[room_boss_id] = 0;
+                }
+
+                g_boss_rooms[room_y][room_x] = false;
+            }
+        }
+
+        pl->_vl_lock.lock(); std::unordered_set<int> vl = pl->_view_list; pl->_vl_lock.unlock();
         for (auto v_id : vl) {
             auto other = g_objects[v_id].load();
             if (other) {
@@ -294,14 +361,15 @@ void disconnect(int c_id) {
         }
         int sx = pl->x / SECTOR_SIZE; int sy = pl->y / SECTOR_SIZE;
         if (sx >= 0 && sx < SECTOR_COUNT_X && sy >= 0 && sy < SECTOR_COUNT_Y) g_sectors[sy][sx].players[c_id] = 0;
-
         {
-            lock_guard<mutex> nl(g_name_lock);
+            std::lock_guard<std::mutex> nl(g_name_lock);
             g_name_to_id.erase(pl->_name);
         }
 
-        lock_guard<mutex> ll(pl->_lock);
-        pl->_state = ST_FREE; pl->_session = nullptr;
+        std::lock_guard<std::mutex> ll(pl->_lock);
+        PushPlayerSaveTask(pl);
+        pl->_state = ST_FREE;
+        pl->_session = nullptr;
     }
 
     if (session) {
@@ -320,10 +388,10 @@ void process_packet(int c_id, unsigned char* packet) {
     switch (packet[1]) {
     case C2S_LOGIN: {
         C2S_Login* p = reinterpret_cast<C2S_Login*>(packet);
-        strncpy_s(pl->_name, p->username, MAX_NAME_LEN);
+        strncpy_s(pl->_name, sizeof(pl->_name), p->username, _TRUNCATE);
 
         {
-            lock_guard<mutex> nl(g_name_lock);
+            std::lock_guard<std::mutex> nl(g_name_lock);
             g_name_to_id[pl->_name] = c_id;
         }
 
@@ -338,8 +406,7 @@ void process_packet(int c_id, unsigned char* packet) {
     case C2S_MOVE: {
         C2S_Move* p = reinterpret_cast<C2S_Move*>(packet);
 
-        // ⭐ [버그 수정 2] 좌표 가중 멀티스레드 보호를 위해 플레이어 락을 조기에 잠급니다.
-        lock_guard<mutex> move_lock(pl->_lock);
+        std::lock_guard<std::mutex> move_lock(pl->_lock);
 
         pl->last_move_time = p->move_time;
         int old_sx = pl->x / SECTOR_SIZE; int old_sy = pl->y / SECTOR_SIZE;
@@ -356,73 +423,84 @@ void process_packet(int c_id, unsigned char* packet) {
 
         int new_sx = pl->x / SECTOR_SIZE; int new_sy = pl->y / SECTOR_SIZE;
 
-        // ⭐ 안전 경계 보정 규칙 추가 (섹터 이탈 방지)
-        if (new_sx < 0) new_sx = 0; else if (new_sx >= SECTOR_COUNT_X) new_sx = SECTOR_COUNT_X - 1;
-        if (new_sy < 0) new_sy = 0; else if (new_sy >= SECTOR_COUNT_Y) new_sy = SECTOR_COUNT_Y - 1;
-
         if (old_sx != new_sx || old_sy != new_sy) {
             if (old_sx >= 0 && old_sx < SECTOR_COUNT_X && old_sy >= 0 && old_sy < SECTOR_COUNT_Y)
                 g_sectors[old_sy][old_sx].players[c_id] = 0;
             g_sectors[new_sy][new_sx].players[c_id] = 1;
-        }
 
-        unordered_set<int> near_list;
-        pl->_vl_lock.lock(); unordered_set<int> old_vlist = pl->_view_list; pl->_vl_lock.unlock();
+            std::unordered_set<int> near_list;
+            pl->_vl_lock.lock(); std::unordered_set<int> old_vlist = pl->_view_list; pl->_vl_lock.unlock();
 
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                int sx = new_sx + dx; int sy = new_sy + dy;
-                if (sx < 0 || sx >= SECTOR_COUNT_X || sy < 0 || sy >= SECTOR_COUNT_Y) continue;
-                for (auto& sec_pl : g_sectors[sy][sx].players) {
-                    if (sec_pl.second == 0) continue;
-                    int other_id = sec_pl.first;
-                    if (other_id == c_id) continue;
-                    auto other = g_objects[other_id].load();
-                    if (other && other->_state == ST_INGAME && can_see(c_id, other_id)) {
-                        near_list.insert(other_id);
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int sx = new_sx + dx; int sy = new_sy + dy;
+                    if (sx < 0 || sx >= SECTOR_COUNT_X || sy < 0 || sy >= SECTOR_COUNT_Y) continue;
+                    for (auto& sec_pl : g_sectors[sy][sx].players) {
+                        if (sec_pl.second == 0) continue;
+                        int other_id = sec_pl.first;
+                        if (other_id == c_id) continue;
+                        auto other = g_objects[other_id].load();
+                        if (other && other->_state == ST_INGAME) {
+                            if (abs(pl->x - other->x) <= VIEW_RANGE && abs(pl->y - other->y) <= VIEW_RANGE) {
+                                near_list.insert(other_id);
+                            }
+                        }
                     }
                 }
             }
-        }
 
-        send_move_object_packet(c_id, c_id);
+            send_move_object_packet(c_id, c_id);
 
-        for (auto& p_id : near_list) {
-            auto other = g_objects[p_id].load();
-            if (!other) continue;
-            if (old_vlist.count(p_id)) {
-                send_move_object_packet(p_id, c_id);
-            }
-            else {
-                pl->_vl_lock.lock(); pl->_view_list.insert(p_id); pl->_vl_lock.unlock();
-                other->_vl_lock.lock(); other->_view_list.insert(c_id); other->_vl_lock.unlock();
-                send_add_object_packet(c_id, p_id); send_add_object_packet(p_id, c_id);
-                if (other->is_npc()) wake_up_npc(p_id);
-            }
-        }
-
-        for (auto& p_id : old_vlist) {
-            if (near_list.count(p_id) == 0) {
+            for (auto& p_id : near_list) {
                 auto other = g_objects[p_id].load();
-                pl->_vl_lock.lock(); pl->_view_list.erase(p_id); pl->_vl_lock.unlock();
-                if (other) {
-                    other->_vl_lock.lock(); other->_view_list.erase(c_id); other->_vl_lock.unlock();
+                if (!other) continue;
+                if (old_vlist.count(p_id)) {
+                    send_move_object_packet(p_id, c_id);
                 }
-                send_remove_object_packet(c_id, p_id); send_remove_object_packet(p_id, c_id);
+                else {
+                    pl->_vl_lock.lock(); pl->_view_list.insert(p_id); pl->_vl_lock.unlock();
+                    other->_vl_lock.lock(); other->_view_list.insert(c_id); other->_vl_lock.unlock();
+                    send_add_object_packet(c_id, p_id); send_add_object_packet(p_id, c_id);
+                    if (other->is_npc()) wake_up_npc(p_id);
+                }
+            }
+
+            for (auto& p_id : old_vlist) {
+                if (near_list.count(p_id) == 0) {
+                    auto other = g_objects[p_id].load();
+                    pl->_vl_lock.lock(); pl->_view_list.erase(p_id); pl->_vl_lock.unlock();
+                    if (other) {
+                        other->_vl_lock.lock(); other->_view_list.erase(c_id); other->_vl_lock.unlock();
+                    }
+                    send_remove_object_packet(c_id, p_id); send_remove_object_packet(p_id, c_id);
+                }
+            }
+        }
+        else {
+            send_move_object_packet(c_id, c_id);
+            pl->_vl_lock.lock(); std::unordered_set<int> current_view = pl->_view_list; pl->_vl_lock.unlock();
+            for (int viewer : current_view) {
+                send_move_object_packet(viewer, c_id);
             }
         }
         break;
     }
     case C2S_CHAT: {
         C2S_Chat* p = reinterpret_cast<C2S_Chat*>(packet);
-        pl->_vl_lock.lock(); unordered_set<int> vlist = pl->_view_list; pl->_vl_lock.unlock();
-        for (auto v_id : vlist) send_chat_message(v_id, p->message);
+        pl->_vl_lock.lock(); std::unordered_set<int> vlist = pl->_view_list; pl->_vl_lock.unlock();
+        for (auto v_id : vlist) send_chat_message(v_id, pl->_name, p->message);
+        send_chat_message(c_id, pl->_name, p->message);
         break;
     }
     case C2S_ATTACK: {
         pl->_vl_lock.lock();
-        unordered_set<int> vlist = pl->_view_list;
+        std::unordered_set<int> vlist = pl->_view_list;
         pl->_vl_lock.unlock();
+
+        if (pl->stat.weapon == null) {
+            send_system_message(c_id, "무기를 선택하기 전에는 공격할 수 없습니다!");
+            break;
+        }
 
         for (auto v_id : vlist) {
             send_attack_broadcast(v_id, c_id, pl->stat.weapon);
@@ -430,9 +508,14 @@ void process_packet(int c_id, unsigned char* packet) {
 
         int sx = pl->x / SECTOR_SIZE;
         int sy = pl->y / SECTOR_SIZE;
-        unordered_set<int> hit_targets;
+        std::unordered_set<int> hit_targets;
 
-        int damage = WeaponReinforceTable.at({ pl->stat.weapon, pl->stat.reinforce_level }).damage;
+        int damage = 10;
+        unsigned char safe_level = (pl->stat.reinforce_level > 5) ? 5 : pl->stat.reinforce_level;
+        auto w_it = WeaponReinforceTable.find({ pl->stat.weapon, safe_level });
+        if (w_it != WeaponReinforceTable.end()) {
+            damage = w_it->second.damage;
+        }
 
         for (int dy = -1; dy <= 1; ++dy) {
             for (int dx = -1; dx <= 1; ++dx) {
@@ -479,21 +562,23 @@ void process_packet(int c_id, unsigned char* packet) {
 
             if (t_obj->is_pc()) {
                 auto t_pl = std::static_pointer_cast<Player>(t_obj);
-                lock_guard<mutex> ll(t_pl->_lock);
-                t_pl->stat.hp -= damage; if (t_pl->stat.hp < 0) t_pl->stat.hp = 0;
+                std::lock_guard<std::mutex> ll(t_pl->_lock);
+                t_pl->stat.hp -= damage;
+                if (t_pl->stat.hp <= 0) {
+                    t_pl->stat.hp = 0;
+                    OVER_EXP* die_over = GetOverExp(); die_over->_comp_type = OP_PLAYER_DIE;
+                    PostQueuedCompletionStatus(h_iocp, 0, t_id, &die_over->_over);
+                    continue;
+                }
                 new_hp = t_pl->stat.hp; t_max_hp = t_pl->stat.max_hp; t_level = t_pl->stat.level; t_exp = t_pl->stat.exp;
             }
             else {
-                // 💥 몬스터(NPC) 타격 시 로직 정밀 보정
                 auto npc = std::static_pointer_cast<NPC>(t_obj);
-                lock_guard<mutex> ll(npc->_lock);
+                std::lock_guard<std::mutex> ll(npc->_lock);
 
-                // ① 유저의 무기 데미지만큼 몬스터의 실시간 현재 체력을 차감합니다.
                 npc->stat.hp -= damage;
                 if (npc->stat.hp < 0) npc->stat.hp = 0;
 
-                // ② 주변 유저들에게 이 몬스터의 체력이 깎였다는 상태 변화 패킷을 보냅니다.
-                // (이 코드가 있어야 몬스터 머리 위의 HP 바가 실시간으로 줄어듭니다!)
                 S2C_StatusChange mon_status_p;
                 mon_status_p.size = sizeof(S2C_StatusChange);
                 mon_status_p.type = S2C_STATUS_CHANGE;
@@ -503,14 +588,12 @@ void process_packet(int c_id, unsigned char* packet) {
                 mon_status_p.level = npc->level;
                 mon_status_p.exp = 0;
 
-                // 내 화면 및 주변 유저 시야에 실시간 체력 변화 브로드캐스트
                 send_packet_to_player(c_id, &mon_status_p);
                 pl->_vl_lock.lock(); auto my_view_for_mon = pl->_view_list; pl->_vl_lock.unlock();
                 for (auto v_id : my_view_for_mon) {
                     send_packet_to_player(v_id, &mon_status_p);
                 }
 
-                // ③ 실제 체력이 0이 되었을 때만 사망 판정을 내립니다!
                 bool is_monster_dead = (npc->stat.hp <= 0);
 
                 if (is_monster_dead) {
@@ -524,9 +607,16 @@ void process_packet(int c_id, unsigned char* packet) {
 
                     pl->stat.exp += reward_exp;
                     pl->stat.gold += npc->gold_reward;
-                    send_chat_message(c_id, "💥 몬스터를 처치하여 경험치를 획득했습니다!");
+                    S2C_GoldUpdate gold_p;
+                    gold_p.size = sizeof(S2C_GoldUpdate);
+                    gold_p.type = S2C_GOLD_UPDATE;
+                    gold_p.gold = pl->stat.gold;
+                    send_packet_to_player(c_id, &gold_p);
 
-                    // 경험치 초기화/차감형 레벨업 루프 가동
+                    char gold_msg[256];
+                    sprintf_s(gold_msg, "몬스터를 처치하여 %d 골드를 획득했습니다! (현재: %dG)", npc->gold_reward, pl->stat.gold);
+                    send_system_message(c_id, gold_msg);
+
                     bool leveled_up = false;
                     while (pl->stat.level < 50) {
                         unsigned long long required_exp = LevelMaxHpTable[pl->stat.level].exp;
@@ -544,7 +634,7 @@ void process_packet(int c_id, unsigned char* packet) {
                     if (leveled_up) {
                         pl->stat.max_hp = LevelMaxHpTable[pl->stat.level].max_hp;
                         pl->stat.hp = pl->stat.max_hp;
-                        send_chat_message(c_id, "🎉 축하합니다! 레벨이 상승했습니다!");
+                        send_system_message(c_id, "축하합니다! 레벨이 상승했습니다!");
                     }
 
                     send_status_change(c_id, pl->stat.hp, pl->stat.max_hp, pl->stat.exp, pl->stat.level);
@@ -556,14 +646,32 @@ void process_packet(int c_id, unsigned char* packet) {
                         send_status_change(v_id, pl->stat.hp, pl->stat.max_hp, pl->stat.exp, pl->stat.level);
                     }
 
-                    // 30초 후 리스폰 등록
-                    event_type respawn_ev;
-                    respawn_ev.obj_id = t_id;
-                    respawn_ev.event_id = EVENT_RESPAWN;
-                    respawn_ev.wakeup_time = system_clock::now() + milliseconds(30000);
-                    timer_queue.push(respawn_ev);
+                    if (npc->is_boss) {
+                        char clear_ann[256];
+                        sprintf_s(clear_ann, "대단합니다! 원정대 리더 [%s] 님이 월드의 최종 보스를 정벌했습니다!!", pl->_name);
+                        for (int i = 0; i < MAX_PLAYERS; ++i) {
+                            auto all_pl = g_objects[i].load();
+                            if (all_pl && all_pl->_state == ST_INGAME) send_system_message(i, clear_ann);
+                        }
+
+                        int room_x = (npc->spawn_x - ROOM_LEFT_X) / GRID_STEP;
+                        int room_y = (ROOM_BOTTOM_Y - npc->spawn_y) / GRID_STEP;
+
+                        if (room_x >= 0 && room_x < 6 && room_y >= 0 && room_y < 6) {
+                            std::lock_guard<std::mutex> lock(g_boss_room_lock);
+                            g_boss_rooms[room_y][room_x] = false;
+                        }
+                        continue;
+                    }
+                    else {
+                        event_type respawn_ev;
+                        respawn_ev.obj_id = t_id;
+                        respawn_ev.event_id = EVENT_RESPAWN;
+                        respawn_ev.wakeup_time = std::chrono::system_clock::now() + std::chrono::milliseconds(30000);
+                        timer_queues[t_id % NUM_TIMER_QUEUES].push(respawn_ev);
+                        continue;
+                    }
                 }
-                // 아직 살아있다면 다음 타겟팅 연산을 위해 계속 루프 진행
                 continue;
             }
 
@@ -579,7 +687,7 @@ void process_packet(int c_id, unsigned char* packet) {
     }
     case C2S_TELEPORT: {
         C2S_Teleport* p = reinterpret_cast<C2S_Teleport*>(packet);
-        lock_guard<mutex> ll(pl->_lock);
+        std::lock_guard<std::mutex> ll(pl->_lock);
 
         int old_sx = pl->x / SECTOR_SIZE; int old_sy = pl->y / SECTOR_SIZE;
         pl->x = p->x; pl->y = p->y;
@@ -595,8 +703,8 @@ void process_packet(int c_id, unsigned char* packet) {
                 g_sectors[new_sy][new_sx].players[c_id] = 1;
         }
 
-        pl->_vl_lock.lock(); unordered_set<int> old_vlist = pl->_view_list; pl->_vl_lock.unlock();
-        unordered_set<int> near_list;
+        pl->_vl_lock.lock(); std::unordered_set<int> old_vlist = pl->_view_list; pl->_vl_lock.unlock();
+        std::unordered_set<int> near_list;
 
         for (int dy = -1; dy <= 1; ++dy) {
             for (int dx = -1; dx <= 1; ++dx) {
@@ -607,8 +715,10 @@ void process_packet(int c_id, unsigned char* packet) {
                     int other_id = sec_pl.first;
                     if (other_id == c_id) continue;
                     auto other = g_objects[other_id].load();
-                    if (other && other->_state == ST_INGAME && can_see(c_id, other_id)) {
-                        near_list.insert(other_id);
+                    if (other && other->_state == ST_INGAME) {
+                        if (abs(pl->x - other->x) <= VIEW_RANGE && abs(pl->y - other->y) <= VIEW_RANGE) {
+                            near_list.insert(other_id);
+                        }
                     }
                 }
             }
@@ -645,7 +755,7 @@ void process_packet(int c_id, unsigned char* packet) {
     }
     case C2S_SELECT_WEAPON: {
         C2S_SelectWeapon* p = reinterpret_cast<C2S_SelectWeapon*>(packet);
-        lock_guard<mutex> ll(pl->_lock);
+        std::lock_guard<std::mutex> ll(pl->_lock);
         pl->stat.weapon = p->weapon;
         send_info_result(c_id, c_id, 0, pl->_name, pl->x, pl->y, pl->stat.weapon, pl->stat.hp, pl->stat.max_hp,
             pl->stat.gold, pl->stat.reinforce_level, pl->stat.exp, pl->stat.level, false);
@@ -664,7 +774,7 @@ void process_packet(int c_id, unsigned char* packet) {
             auto other_obj = g_objects[target_id].load();
             if (other_obj && other_obj->is_pc() && other_obj->_state == ST_INGAME) {
                 auto other_pl = std::static_pointer_cast<Player>(other_obj);
-                lock_guard<mutex> ll(other_pl->_lock);
+                std::lock_guard<std::mutex> ll(other_pl->_lock);
                 bool in_party = (other_pl->stat.party_id != 0);
                 send_info_result(c_id, target_id, 0, other_pl->_name, other_pl->x, other_pl->y,
                     other_pl->stat.weapon, other_pl->stat.hp, other_pl->stat.max_hp,
@@ -673,7 +783,7 @@ void process_packet(int c_id, unsigned char* packet) {
             }
         }
         else {
-            send_chat_message(c_id, "해당 유저를 찾을 수 없거나 미접속 상태입니다.");
+            send_system_message(c_id, "해당 유저를 찾을 수 없거나 미접속 상태입니다.");
         }
         break;
     }
@@ -686,33 +796,67 @@ void process_packet(int c_id, unsigned char* packet) {
             }
         }
 
-        if (current_portal == nullptr) {
-            break;
+        if (current_portal == nullptr) break;
+
+        std::vector<int> targets_to_move;
+        int p_id = pl->stat.party_id;
+        bool can_enter_dungeon = true;
+        std::string low_level_member_name = "";
+
+        if (p_id != 0) {
+            std::lock_guard<std::mutex> lock(g_parties_lock);
+            if (g_parties.count(p_id)) {
+                auto party = g_parties[p_id];
+                std::lock_guard<std::mutex> plock(party->p_lock);
+
+                for (int m_id : party->members) {
+                    auto m_obj = g_objects[m_id].load();
+                    if (m_obj && m_obj->is_pc() && m_obj->_state == ST_INGAME) {
+                        auto m_pl = std::static_pointer_cast<Player>(m_obj);
+
+                        if (m_pl->stat.level < current_portal->required_level) {
+                            can_enter_dungeon = false;
+                            low_level_member_name = m_pl->_name;
+                            break;
+                        }
+                        targets_to_move.push_back(m_id);
+                    }
+                }
+            }
+        }
+        else {
+            if (pl->stat.level < current_portal->required_level) {
+                can_enter_dungeon = false;
+            }
+            targets_to_move.push_back(c_id);
         }
 
-        if (pl->stat.level < current_portal->required_level) {
+        if (!can_enter_dungeon) {
             char err_msg[256];
-            sprintf_s(err_msg, "던전 입장 레벨이 부족합니다. (필요 레벨: %d)", current_portal->required_level);
-            send_chat_message(c_id, err_msg);
+            if (p_id != 0) {
+                sprintf_s(err_msg, "파티원 [%s] 님의 레벨이 부족하여 던전에 입장할 수 없습니다. (필요 레벨: %d)",
+                    low_level_member_name.c_str(), current_portal->required_level);
+            }
+            else {
+                sprintf_s(err_msg, "던전 입장 레벨이 부족합니다. (필요 레벨: %d)", current_portal->required_level);
+            }
+        send_make_log_or_msg:
+            send_system_message(c_id, err_msg);
             send_dungeon_result(c_id, current_portal->dungeon, false, pl->x, pl->y);
             break;
         }
 
-        short to_x = 0;
-        short to_y = 0;
+        short to_x = current_portal->dest_x;
+        short to_y = current_portal->dest_y;
 
         if (current_portal->dungeon == FINAL_BOSS) {
-            int allocated_x = -1;
-            int allocated_y = -1;
-
+            int allocated_x = -1; int allocated_y = -1;
             {
                 std::lock_guard<std::mutex> lock(g_boss_room_lock);
                 for (int y = 0; y < 6; ++y) {
                     for (int x = 0; x < 6; ++x) {
                         if (!g_boss_rooms[y][x]) {
-                            g_boss_rooms[y][x] = true;
-                            allocated_x = x;
-                            allocated_y = y;
+                            g_boss_rooms[y][x] = true; allocated_x = x; allocated_y = y;
                             break;
                         }
                     }
@@ -721,42 +865,71 @@ void process_packet(int c_id, unsigned char* packet) {
             }
 
             if (allocated_x == -1) {
-                send_chat_message(c_id, "모든 보스 전장이 가득 찼습니다. 잠시 후 다시 시도해 주세요.");
+                send_system_message(c_id, "모든 보스 전장이 가득 찼습니다. 잠시 후 다시 시도해 주세요.");
                 send_dungeon_result(c_id, current_portal->dungeon, false, pl->x, pl->y);
                 break;
             }
 
-            to_x = START_ROOM_X + (allocated_x * GRID_STEP);
-            to_y = START_ROOM_Y - (allocated_y * GRID_STEP);
+            int base_room_x = ROOM_LEFT_X + (allocated_x * GRID_STEP);
+            int base_room_y = ROOM_BOTTOM_Y - (allocated_y * GRID_STEP);
 
-            send_chat_message(c_id, "파이널 보스 전장에 입장했습니다! 스페이스바 상호작용 성공!");
+            int center_x = base_room_x + 50;
+            int center_y = base_room_y - 50;
+
+            int room_boss_id = NPC_ID_START + 100000 + (allocated_y * 6 + allocated_x);
+            auto boss_npc = std::make_shared<NPC>(room_boss_id);
+
+            boss_npc->x = center_x;
+            boss_npc->y = center_y;
+            boss_npc->spawn_x = boss_npc->x;
+            boss_npc->spawn_y = boss_npc->y;
+
+            const auto& meta = MonsterTemplates[7];
+            boss_npc->name = meta.name;
+            boss_npc->level = meta.level;
+            boss_npc->stat.hp = meta.max_hp;
+            boss_npc->stat.max_hp = meta.max_hp;
+            boss_npc->stat.damage = meta.damage;
+            boss_npc->ai_type = meta.ai_type;
+            boss_npc->move_type = meta.move_type;
+            boss_npc->gold_reward = meta.gold_reward;
+            boss_npc->visual_id = 8;
+
+            boss_npc->is_boss = true;
+            boss_npc->_state = ST_INGAME;
+            boss_npc->_active_npc = true;
+
+            g_objects[room_boss_id].store(boss_npc);
+            g_sectors[boss_npc->y / SECTOR_SIZE][boss_npc->x / SECTOR_SIZE].players[room_boss_id] = 1;
+
+            event_type boss_ev; boss_ev.obj_id = room_boss_id; boss_ev.event_id = EVENT_MOVE; boss_ev.target_id = -1;
+            boss_ev.wakeup_time = system_clock::now();
+            timer_queues[room_boss_id % NUM_TIMER_QUEUES].push(boss_ev);
+
+            to_x = center_x;
+            to_y = center_y + 40;
         }
-        else {
-            to_x = current_portal->dest_x;
-            to_y = current_portal->dest_y;
-            send_chat_message(c_id, "던전에 입장했습니다.");
+
+        for (int member_id : targets_to_move) {
+            auto m_obj = g_objects[member_id].load();
+            if (!m_obj || m_obj->_state != ST_INGAME) continue;
+
+            if (current_portal->dungeon == FINAL_BOSS) {
+                send_system_message(member_id, "파티 리더를 따라 [최종 보스 레이드] 전장으로 입장합니다!");
+            }
+            else {
+                char dungeon_msg[256];
+                sprintf_s(dungeon_msg, "파티 리더를 따라 [%d번 던전 사냥터]로 진입합니다.", current_portal->dungeon + 1);
+                send_system_message(member_id, dungeon_msg);
+            }
+
+            send_dungeon_result(member_id, current_portal->dungeon, true, to_x, to_y);
+
+            C2S_Teleport tp;
+            tp.size = sizeof(C2S_Teleport); tp.type = C2S_TELEPORT;
+            tp.x = to_x; tp.y = to_y;
+            process_packet(member_id, reinterpret_cast<unsigned char*>(&tp));
         }
-
-        send_dungeon_result(c_id, current_portal->dungeon, true, to_x, to_y);
-
-        C2S_Teleport tp;
-        tp.size = sizeof(C2S_Teleport);
-        tp.type = C2S_TELEPORT;
-        tp.x = to_x;
-        tp.y = to_y;
-        process_packet(c_id, reinterpret_cast<unsigned char*>(&tp));
-
-        break;
-    }
-    case C2S_DUNGEON_EXIT: {
-        C2S_DungeonExit* p = reinterpret_cast<C2S_DungeonExit*>(packet);
-        short town_x = WORLD_WIDTH / 2; short town_y = WORLD_HEIGHT / 2;
-
-        send_dungeon_result(c_id, p->dungeon, true, town_x, town_y);
-
-        C2S_Teleport tp;
-        tp.size = sizeof(C2S_Teleport); tp.type = C2S_TELEPORT; tp.x = town_x; tp.y = town_y;
-        process_packet(c_id, reinterpret_cast<unsigned char*>(&tp));
         break;
     }
     case C2S_INTERACT: {
@@ -775,7 +948,15 @@ void process_packet(int c_id, unsigned char* packet) {
         }
 
         if (is_near_npc) {
-            std::string msg = npc_name + " 대장간 창을 엽니다.";
+            int next_cost = -1;
+            if (pl->stat.reinforce_level < 5) {
+                auto key_rnf = std::make_pair(pl->stat.weapon, static_cast<short>(pl->stat.reinforce_level));
+                auto it_rnf = WeaponReinforceTable.find(key_rnf);
+                if (it_rnf != WeaponReinforceTable.end()) {
+                    next_cost = it_rnf->second.cost;
+                }
+            }
+            std::string msg = std::to_string(next_cost);
             send_interact_result(c_id, true, msg.c_str());
         }
         else {
@@ -785,13 +966,18 @@ void process_packet(int c_id, unsigned char* packet) {
     }
     case C2S_REINFORCE: {
         C2S_Reinforce* p = reinterpret_cast<C2S_Reinforce*>(packet);
-        lock_guard<mutex> ll(pl->_lock);
+        std::lock_guard<std::mutex> ll(pl->_lock);
+
+        if (pl->stat.weapon == null) {
+            send_system_message(c_id, "무기를 장착하지 않은 상태에서는 강화할 수 없습니다.");
+            break;
+        }
 
         auto key = std::make_pair(pl->stat.weapon, static_cast<short>(pl->stat.reinforce_level));
         auto it = WeaponReinforceTable.find(key);
 
         if (it == WeaponReinforceTable.end()) {
-            send_chat_message(c_id, "더 이상 강화할 수 없거나 잘못된 무기 정보입니다.");
+            send_system_message(c_id, "최고 단계에 도달했거나 더 이상 강화할 수 없는 무기 정보입니다.");
             break;
         }
 
@@ -799,29 +985,26 @@ void process_packet(int c_id, unsigned char* packet) {
         int cost = ref_info.cost;
         float rate = ref_info.success_rate;
 
-        int current_gold = pl->stat.gold;
-
-        if (current_gold >= cost) {
-            current_gold -= cost;
+        if (pl->stat.gold >= cost) {
+            pl->stat.gold -= cost;
 
             float random_value = static_cast<float>(rand() % 1000) / 10.0f;
             bool success = (random_value < rate);
 
             if (success) {
                 pl->stat.reinforce_level++;
-                send_chat_message(c_id, "강화에 성공했습니다!");
+                send_system_message(c_id, "대장장이: 강화에 대성공했습니다! 무기의 광채가 달라집니다.");
             }
             else {
-                send_chat_message(c_id, "강화에 실패했습니다.");
+                send_system_message(c_id, "대장장이: 손이 미끄러졌군요! 강화에 실패했습니다.");
             }
 
-            PushPlayerSaveTask(c_id);
-
-            send_reinforce_result(c_id, success, pl->stat.reinforce_level, current_gold);
+            PushPlayerSaveTask(pl);
+            send_reinforce_result(c_id, success, pl->stat.reinforce_level, pl->stat.gold);
         }
         else {
-            send_reinforce_result(c_id, false, pl->stat.reinforce_level, current_gold);
-            send_chat_message(c_id, "보유 자금이 부족하여 강화를 시도할 수 없습니다.");
+            send_reinforce_result(c_id, false, pl->stat.reinforce_level, pl->stat.gold);
+            send_system_message(c_id, "보유 자금이 부족하여 강화를 시도할 수 없습니다.");
         }
         break;
     }
@@ -838,20 +1021,20 @@ void process_packet(int c_id, unsigned char* packet) {
             auto target_pl = std::static_pointer_cast<Player>(g_objects[target_id].load());
             target_pl->stat.invited_by = c_id;
             send_party_invite_notification(target_id, c_id);
-            send_chat_message(c_id, "파티 초대를 보냈습니다.");
+            send_system_message(c_id, "파티 초대를 보냈습니다.");
         }
         else {
-            send_chat_message(c_id, "대상을 찾을 수 없습니다.");
+            send_system_message(c_id, "대상을 찾을 수 없습니다.");
         }
         break;
     }
     case C2S_ACCEPT_PARTY: {
         if (pl->stat.invited_by == -1) {
-            send_chat_message(c_id, "받은 파티 초대가 없습니다.");
+            send_system_message(c_id, "받은 파티 초대가 없습니다.");
             break;
         }
         if (pl->stat.party_id != 0) {
-            send_chat_message(c_id, "이미 다른 파티에 속해 있습니다.");
+            send_system_message(c_id, "이미 다른 파티에 속해 있습니다.");
             break;
         }
 
@@ -859,7 +1042,7 @@ void process_packet(int c_id, unsigned char* packet) {
         auto inviter_obj = g_objects[inviter_id].load();
 
         if (!inviter_obj || !inviter_obj->is_pc() || inviter_obj->_state != ST_INGAME) {
-            send_chat_message(c_id, "초대자가 게임에 없거나 접속이 끊겼습니다.");
+            send_system_message(c_id, "초대자가 게임에 없거나 접속이 끊겼습니다.");
             pl->stat.invited_by = -1;
             break;
         }
@@ -895,16 +1078,16 @@ void process_packet(int c_id, unsigned char* packet) {
         if (party) {
             std::lock_guard<std::mutex> p_lock(party->p_lock);
             if (party->members.size() >= MAX_PARTY_SIZE) {
-                send_chat_message(c_id, "해당 파티의 인원이 꽉 찼습니다.");
+                send_system_message(c_id, "해당 파티의 인원이 꽉 찼습니다.");
             }
             else {
                 party->members.push_back(c_id);
                 pl->stat.party_id = target_party_id;
-                send_chat_message(c_id, "파티에 가입했습니다!");
+                send_system_message(c_id, "파티에 가입했습니다!");
             }
         }
         else {
-            send_chat_message(c_id, "파티를 생성하거나 찾을 수 없습니다.");
+            send_system_message(c_id, "파티를 생성하거나 찾을 수 없습니다.");
         }
 
         if (pl->stat.party_id != 0) {
@@ -913,12 +1096,12 @@ void process_packet(int c_id, unsigned char* packet) {
         break;
     }
     case C2S_REFUSE_PARTY: {
-        send_chat_message(c_id, "요청을 거절했습니다.");
+        send_system_message(c_id, "요청을 거절했습니다.");
         break;
     }
     case C2S_LEAVE_PARTY: {
         if (pl->stat.party_id == 0) {
-            send_chat_message(c_id, "속한 파티가 없습니다.");
+            send_system_message(c_id, "속한 파티가 없습니다.");
             break;
         }
 
@@ -933,7 +1116,7 @@ void process_packet(int c_id, unsigned char* packet) {
 
                 party->members.erase(std::remove(party->members.begin(), party->members.end(), c_id), party->members.end());
 
-                send_chat_message(c_id, "파티에서 탈퇴했습니다.");
+                send_system_message(c_id, "파티에서 탈퇴했습니다.");
 
                 if (party->members.empty()) {
                     g_parties.erase(my_party_id);
@@ -969,7 +1152,7 @@ void do_npc_random_move(int npc_id) {
     auto npc = std::static_pointer_cast<NPC>(obj);
 
     int old_sx = npc->x / SECTOR_SIZE; int old_sy = npc->y / SECTOR_SIZE;
-    npc->_vl_lock.lock(); unordered_set<int> old_vl = npc->_view_list; npc->_vl_lock.unlock();
+    npc->_vl_lock.lock(); std::unordered_set<int> old_vl = npc->_view_list; npc->_vl_lock.unlock();
 
     switch (rand() % 4) {
     case 0: if (npc->x < (WORLD_WIDTH - 1)) npc->x++; break;
@@ -984,7 +1167,7 @@ void do_npc_random_move(int npc_id) {
         g_sectors[new_sy][new_sx].players[npc_id] = 1;
     }
 
-    unordered_set<int> new_vl;
+    std::unordered_set<int> new_vl;
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             int nx = new_sx + dx; int ny = new_sy + dy;
@@ -995,7 +1178,7 @@ void do_npc_random_move(int npc_id) {
                 if (p_id == npc_id) continue;
                 auto other = g_objects[p_id].load();
                 if (!other || other->_state != ST_INGAME) continue;
-                if (can_see(npc_id, p_id)) new_vl.insert(p_id);
+                if (abs(npc->x - other->x) <= VIEW_RANGE && abs(npc->y - other->y) <= VIEW_RANGE) new_vl.insert(p_id);
             }
         }
     }
@@ -1023,7 +1206,7 @@ void do_npc_random_move(int npc_id) {
             }
         }
     }
-    npc->npc_last_move_time = system_clock::now();
+    npc->npc_last_move_time = std::chrono::system_clock::now();
 }
 
 void worker_thread(HANDLE h_iocp) {
@@ -1035,7 +1218,7 @@ void worker_thread(HANDLE h_iocp) {
         if (FALSE == ret || ((0 == num_bytes) && ((ex_over->_comp_type == OP_RECV) || (ex_over->_comp_type == OP_SEND)))) {
             if (ex_over->_comp_type != OP_ACCEPT) {
                 disconnect(static_cast<int>(key));
-                if (ex_over->_comp_type == OP_SEND) delete ex_over;
+                if (ex_over->_comp_type == OP_SEND) FreeOverExp(ex_over);
             }
             continue;
         }
@@ -1052,9 +1235,15 @@ void worker_thread(HANDLE h_iocp) {
                 CreateIoCompletionPort(reinterpret_cast<HANDLE>(g_c_socket), h_iocp, client_id, 0);
                 new_sess->do_recv();
                 g_c_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+
+                int opt_val = 1;
+                setsockopt(g_c_socket, IPPROTO_TCP, TCP_NODELAY, (char*)&opt_val, sizeof(opt_val));
             }
             else {
-                closesocket(g_c_socket); g_c_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+                closesocket(g_c_socket);
+                g_c_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+                int opt_val = 1;
+                setsockopt(g_c_socket, IPPROTO_TCP, TCP_NODELAY, (char*)&opt_val, sizeof(opt_val));
             }
             ZeroMemory(&g_a_over._over, sizeof(g_a_over._over));
             int addr_size = sizeof(SOCKADDR_IN);
@@ -1097,21 +1286,27 @@ void worker_thread(HANDLE h_iocp) {
             session->do_recv();
             break;
         }
-        case OP_SEND: delete ex_over; break;
+        case OP_SEND: FreeOverExp(ex_over); break;
 
         case OP_NPCMOVE: {
-            delete ex_over;
+            FreeOverExp(ex_over);
             int npc_id = static_cast<int>(key);
 
             auto obj = g_objects[npc_id].load();
             if (!obj || obj->_state != ST_INGAME) break;
             auto npc = std::static_pointer_cast<NPC>(obj);
 
+            if (npc->is_casting_skill) {
+                event_type ev; ev.event_id = EVENT_MOVE; ev.obj_id = npc_id; ev.target_id = -1;
+                ev.wakeup_time = std::chrono::system_clock::now() + std::chrono::milliseconds(MOVE_COOL_TIME);
+                timer_queues[npc_id % NUM_TIMER_QUEUES].push(ev);
+                break;
+            }
+
             int target_player_id = -1;
             bool has_nearby_player = false;
             int sx = npc->x / SECTOR_SIZE; int sy = npc->y / SECTOR_SIZE;
 
-            // 섹터 범위 예외 안전망
             if (sx < 0 || sx >= SECTOR_COUNT_X || sy < 0 || sy >= SECTOR_COUNT_Y) break;
 
             for (int dy = -1; dy <= 1 && !has_nearby_player; ++dy) {
@@ -1122,30 +1317,162 @@ void worker_thread(HANDLE h_iocp) {
                         if (sec_pl.second == 0) continue;
                         int p_id = sec_pl.first;
 
-                        // 진짜 유저(0 ~ MAX_PLAYERS) 범위만 필터링
                         if (p_id < 0 || p_id >= MAX_PLAYERS) continue;
 
                         auto other = g_objects[p_id].load();
-                        if (other && other->is_pc() && other->_state == ST_INGAME && can_see(npc_id, p_id)) {
-                            target_player_id = p_id;
-                            has_nearby_player = true;
-                            break;
+                        if (other && other->is_pc() && other->_state == ST_INGAME) {
+                            if (abs(npc->x - other->x) <= VIEW_RANGE && abs(npc->y - other->y) <= VIEW_RANGE) {
+                                target_player_id = p_id;
+                                has_nearby_player = true;
+                                break;
+                            }
                         }
                     }
                 }
             }
 
-            // 진짜 타겟 유저가 있거나, 타겟은 없지만 평화 상태의 로밍/고정 이동 규칙을 수행해야 할 때 가동
             g_lua_mgr.RunAI(npc_id, target_player_id);
 
-            // 계속 유저가 감지된다면 무한 루프 과부하 방지를 위해 1초(MOVE_COOL_TIME) 딜레이 뒤 다시 알람을 주도록 세팅
             if (has_nearby_player) {
                 event_type ev; ev.event_id = EVENT_MOVE; ev.obj_id = npc_id; ev.target_id = -1;
-                ev.wakeup_time = system_clock::now() + milliseconds(MOVE_COOL_TIME);
-                timer_queue.push(ev);
+                ev.wakeup_time = std::chrono::system_clock::now() + std::chrono::milliseconds(MOVE_COOL_TIME);
+                timer_queues[npc_id % NUM_TIMER_QUEUES].push(ev);
             }
             else {
                 npc->_active_npc = false;
+            }
+            break;
+        }
+        case OP_BOSS_SKILL_EXPLODE: {
+            FreeOverExp(ex_over);
+            int boss_id = static_cast<int>(key);
+            auto b_obj = g_objects[boss_id].load();
+            if (!b_obj || b_obj->_state != ST_INGAME) break;
+            auto npc = std::static_pointer_cast<NPC>(b_obj);
+            npc->is_casting_skill = false;
+
+            int sx = npc->x / SECTOR_SIZE; int sy = npc->y / SECTOR_SIZE;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int nx = sx + dx; int ny = sy + dy;
+                    if (nx < 0 || nx >= SECTOR_COUNT_X || ny < 0 || ny >= SECTOR_COUNT_Y) continue;
+                    for (auto& sec_pl : g_sectors[ny][nx].players) {
+                        if (sec_pl.second == 0) continue;
+                        int p_id = sec_pl.first;
+
+                        if (p_id >= 0 && p_id < MAX_PLAYERS) {
+                            auto p_obj = g_objects[p_id].load();
+                            if (p_obj && p_obj->_state == ST_INGAME) {
+                                auto pl = std::static_pointer_cast<Player>(p_obj);
+
+                                if (max(abs(npc->x - pl->x), abs(npc->y - pl->y)) <= 5) {
+                                    std::lock_guard<std::mutex> ll(pl->_lock);
+                                    pl->stat.hp -= 2000;
+                                    if (pl->stat.hp <= 0) {
+                                        pl->stat.hp = 0;
+                                        OVER_EXP* die_over = GetOverExp(); die_over->_comp_type = OP_PLAYER_DIE;
+                                        PostQueuedCompletionStatus(h_iocp, 0, p_id, &die_over->_over);
+                                        continue;
+                                    }
+
+                                    pl->is_confused = true;
+
+                                    send_system_message(p_id, "대지분쇄 폭발! 2000의 피해를 입고 [혼란: 조작 반전] 상태가 됩니다!");
+
+                                    S2C_StatusChange status_p;
+                                    status_p.size = sizeof(S2C_StatusChange); status_p.type = S2C_STATUS_CHANGE;
+                                    status_p.object_id = p_id; status_p.hp = pl->stat.hp; status_p.max_hp = pl->stat.max_hp;
+                                    status_p.level = pl->stat.level; status_p.exp = pl->stat.exp;
+                                    send_packet_to_player(p_id, &status_p);
+
+                                    S2C_StatusEffect effect_p;
+                                    effect_p.size = sizeof(S2C_StatusEffect); effect_p.type = S2C_STATUS_EFFECT;
+                                    effect_p.is_confused = true;
+                                    send_packet_to_player(p_id, &effect_p);
+
+                                    event_type cure_ev; cure_ev.obj_id = p_id; cure_ev.event_id = EVENT_CONFUSE_END;
+                                    cure_ev.wakeup_time = std::chrono::system_clock::now() + std::chrono::seconds(5);
+                                    timer_queues[p_id % NUM_TIMER_QUEUES].push(cure_ev);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        case OP_BOSS_CURE_EFFECT: {
+            FreeOverExp(ex_over);
+            int p_id = static_cast<int>(key);
+            auto p_obj = g_objects[p_id].load();
+            if (p_obj) {
+                auto pl = std::static_pointer_cast<Player>(p_obj);
+                std::lock_guard<std::mutex> ll(pl->_lock);
+                pl->is_confused = false;
+                send_system_message(p_id, "혼란이 해제되어 조작이 정상 상태로 복구됩니다.");
+
+                S2C_StatusEffect effect_p;
+                effect_p.size = sizeof(S2C_StatusEffect); effect_p.type = S2C_STATUS_EFFECT;
+                effect_p.is_confused = false;
+                send_packet_to_player(p_id, &effect_p);
+            }
+            break;
+        }
+        case OP_TOWN_RECOVERY: {
+            FreeOverExp(ex_over);
+            for (int i = 0; i < MAX_PLAYERS; ++i) {
+                auto obj = g_objects[i].load();
+                if (obj && obj->_state == ST_INGAME) {
+                    auto pl = std::static_pointer_cast<Player>(obj);
+                    if (pl->x >= 900 && pl->x <= 1100 && pl->y >= 900 && pl->y <= 1100) {
+                        std::lock_guard<std::mutex> ll(pl->_lock);
+                        if (pl->stat.hp < pl->stat.max_hp) {
+                            int amount = pl->stat.max_hp / 10;
+                            pl->stat.hp += amount;
+                            if (pl->stat.hp > pl->stat.max_hp) pl->stat.hp = pl->stat.max_hp;
+
+                            S2C_StatusChange status_p;
+                            status_p.size = sizeof(S2C_StatusChange); status_p.type = S2C_STATUS_CHANGE;
+                            status_p.object_id = i; status_p.hp = pl->stat.hp; status_p.max_hp = pl->stat.max_hp;
+                            status_p.level = pl->stat.level; status_p.exp = pl->stat.exp;
+                            send_packet_to_player(i, &status_p);
+
+                            pl->_vl_lock.lock(); auto vlist = pl->_view_list; pl->_vl_lock.unlock();
+                            for (auto v_id : vlist) send_packet_to_player(v_id, &status_p);
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        case OP_PLAYER_DIE: {
+            FreeOverExp(ex_over);
+            int p_id = static_cast<int>(key);
+            auto obj = g_objects[p_id].load();
+            if (obj && obj->_state == ST_INGAME) {
+                auto pl = std::static_pointer_cast<Player>(obj);
+                {
+                    std::lock_guard<std::mutex> ll(pl->_lock);
+                    pl->stat.exp /= 2;
+                    pl->stat.hp = pl->stat.max_hp;
+                    pl->is_confused = false;
+                }
+                send_system_message(p_id, "치명상을 입어 사망했습니다! 경험치를 잃고 마을로 이송됩니다.");
+
+                S2C_StatusEffect effect_p;
+                effect_p.size = sizeof(S2C_StatusEffect); effect_p.type = S2C_STATUS_EFFECT;
+                effect_p.is_confused = false;
+                send_packet_to_player(p_id, &effect_p);
+
+                S2C_StatusChange status_p;
+                status_p.size = sizeof(S2C_StatusChange); status_p.type = S2C_STATUS_CHANGE;
+                status_p.object_id = p_id; status_p.hp = pl->stat.hp; status_p.max_hp = pl->stat.max_hp;
+                status_p.level = pl->stat.level; status_p.exp = pl->stat.exp;
+                send_packet_to_player(p_id, &status_p);
+
+                C2S_Teleport tp;
+                tp.size = sizeof(C2S_Teleport); tp.type = C2S_TELEPORT; tp.x = 1000; tp.y = 1000;
+                process_packet(p_id, reinterpret_cast<unsigned char*>(&tp));
             }
             break;
         }
@@ -1154,30 +1481,50 @@ void worker_thread(HANDLE h_iocp) {
 }
 
 void timer_thread() {
+    static auto last_recovery = std::chrono::system_clock::now();
     while (true) {
-        event_type ev;
-        if (timer_queue.try_pop(ev)) {
-            if (ev.wakeup_time <= system_clock::now()) {
-                if (ev.event_id == EVENT_MOVE) {
-                    OVER_EXP* move_over = new OVER_EXP; move_over->_comp_type = OP_NPCMOVE;
-                    PostQueuedCompletionStatus(h_iocp, -1, ev.obj_id, &move_over->_over);
-                }
-                else if (ev.event_id == EVENT_RESPAWN) {
-                    auto obj = g_objects[ev.obj_id].load();
-                    if (obj) {
-                        auto npc = std::static_pointer_cast<NPC>(obj);
-                        npc->x = npc->spawn_x;
-                        npc->y = npc->spawn_y;
-                        npc->_state = ST_INGAME;
-                        npc->_active_npc = false;
-                        g_sectors[npc->y / SECTOR_SIZE][npc->x / SECTOR_SIZE].players[ev.obj_id] = 1;
-                        std::cout << "[부활 알림] 몬스터 " << ev.obj_id << "번이 지정 좌표에 리스폰되었습니다." << std::endl;
+        if (std::chrono::system_clock::now() - last_recovery >= std::chrono::seconds(5)) {
+            last_recovery = std::chrono::system_clock::now();
+            OVER_EXP* rec_over = GetOverExp(); rec_over->_comp_type = OP_TOWN_RECOVERY;
+            PostQueuedCompletionStatus(h_iocp, 0, 0, &rec_over->_over);
+        }
+
+        for (int i = 0; i < NUM_TIMER_QUEUES; ++i) {
+            event_type ev;
+            while (timer_queues[i].try_pop(ev)) {
+                if (ev.wakeup_time <= std::chrono::system_clock::now()) {
+                    if (ev.event_id == EVENT_MOVE) {
+                        OVER_EXP* move_over = GetOverExp(); move_over->_comp_type = OP_NPCMOVE;
+                        PostQueuedCompletionStatus(h_iocp, -1, ev.obj_id, &move_over->_over);
+                    }
+                    else if (ev.event_id == EVENT_RESPAWN) {
+                        auto obj = g_objects[ev.obj_id].load();
+                        if (obj) {
+                            auto npc = std::static_pointer_cast<NPC>(obj);
+                            npc->x = npc->spawn_x;
+                            npc->y = npc->spawn_y;
+                            npc->stat.hp = npc->stat.max_hp;
+                            npc->_state = ST_INGAME;
+                            npc->_active_npc = false;
+                            g_sectors[npc->y / SECTOR_SIZE][npc->x / SECTOR_SIZE].players[ev.obj_id] = 1;
+                        }
+                    }
+                    else if (ev.event_id == EVENT_BOSS_EXPLOSION) {
+                        OVER_EXP* skill_over = GetOverExp(); skill_over->_comp_type = OP_BOSS_SKILL_EXPLODE;
+                        PostQueuedCompletionStatus(h_iocp, ev.target_id, ev.obj_id, &skill_over->_over);
+                    }
+                    else if (ev.event_id == EVENT_CONFUSE_END) {
+                        OVER_EXP* cure_over = GetOverExp(); cure_over->_comp_type = OP_BOSS_CURE_EFFECT;
+                        PostQueuedCompletionStatus(h_iocp, -1, ev.obj_id, &cure_over->_over);
                     }
                 }
+                else {
+                    timer_queues[i].push(ev);
+                    break;
+                }
             }
-            else { timer_queue.push(ev); this_thread::sleep_for(chrono::milliseconds(1)); }
         }
-        else { this_thread::sleep_for(chrono::milliseconds(1)); }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
@@ -1195,9 +1542,13 @@ void InitPlayerFromDB(int c_id, std::string name, const DB_Task& data) {
         pl->stat.hp = data.max_hp;
         pl->stat.max_hp = data.max_hp;
         pl->stat.weapon = data.weapon;
-        pl->stat.reinforce_level = data.reinforce_level;
-        pl->stat.gold = data.gold;
 
+        pl->stat.reinforce_level = data.reinforce_level;
+        if (pl->stat.reinforce_level > 5) {
+            pl->stat.reinforce_level = 5;
+        }
+
+        pl->stat.gold = data.gold;
         pl->_state = ST_INGAME;
     }
 
@@ -1209,12 +1560,10 @@ void InitPlayerFromDB(int c_id, std::string name, const DB_Task& data) {
     info.size = sizeof(S2C_AvatarInfo);
     info.type = S2C_AVATAR_INFO;
     info.playerId = c_id;
-
-    // ⭐ [버그 수정 3] 하드코딩된 대문자 'player'는 컴파일 에러 유발 요소이므로 
-    // 실제 DB에서 복구해낸 무기 타입 번호로 정확하게 채워줍니다.
     info.visualId = static_cast<int>(data.weapon);
 
-    strcpy_s(info.username, pl->_name);
+    strncpy_s(info.username, sizeof(info.username), pl->_name, _TRUNCATE);
+
     info.x = pl->x; info.y = pl->y;
     info.hp = pl->stat.hp; info.max_hp = pl->stat.max_hp;
     info.level = pl->stat.level; info.exp = pl->stat.exp;
@@ -1229,14 +1578,16 @@ void InitPlayerFromDB(int c_id, std::string name, const DB_Task& data) {
                 int other_id = sec_pl.first;
                 if (other_id == c_id) continue;
                 auto other = g_objects[other_id].load();
-                if (!other || other->_state != ST_INGAME || !can_see(c_id, other_id)) continue;
+                if (!other || other->_state != ST_INGAME) continue;
 
-                pl->_vl_lock.lock(); pl->_view_list.insert(other_id); pl->_vl_lock.unlock();
-                other->_vl_lock.lock(); other->_view_list.insert(c_id); other->_vl_lock.unlock();
+                if (abs(pl->x - other->x) <= VIEW_RANGE && abs(pl->y - other->y) <= VIEW_RANGE) {
+                    pl->_vl_lock.lock(); pl->_view_list.insert(other_id); pl->_vl_lock.unlock();
+                    other->_vl_lock.lock(); other->_view_list.insert(c_id); other->_vl_lock.unlock();
 
-                send_add_object_packet(c_id, other_id);
-                send_add_object_packet(other_id, c_id);
-                if (other->is_npc()) wake_up_npc(other_id);
+                    send_add_object_packet(c_id, other_id);
+                    send_add_object_packet(other_id, c_id);
+                    if (other->is_npc()) wake_up_npc(other_id);
+                }
             }
         }
     }
@@ -1244,7 +1595,6 @@ void InitPlayerFromDB(int c_id, std::string name, const DB_Task& data) {
         send_info_result(c_id, c_id, 0, pl->_name, pl->x, pl->y, pl->stat.weapon, pl->stat.hp, pl->stat.max_hp,
             pl->stat.gold, pl->stat.reinforce_level, pl->stat.exp, pl->stat.level, false);
     }
-    std::cout << "[DB 컴플리션] 유저 불러오기 완료: " << name << " (Lv." << (int)data.level << ")" << std::endl;
 }
 
 int main() {
@@ -1261,6 +1611,10 @@ int main() {
     }
 
     g_s_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+
+    int opt_val = 1;
+    setsockopt(g_s_socket, IPPROTO_TCP, TCP_NODELAY, (char*)&opt_val, sizeof(opt_val));
+
     SOCKADDR_IN server_addr; memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET; server_addr.sin_port = htons(PORT); server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     ::bind(g_s_socket, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)); listen(g_s_socket, SOMAXCONN);
@@ -1271,15 +1625,12 @@ int main() {
 
     int spawned_count = 0;
 
-    // 20만 마리를 7개의 사냥터 구역에 똑같이 분배 (구역당 약 28,571마리씩)
     const int NPCS_PER_ZONE = NUM_NPCS / 7;
 
-    // 사냥터 구역 테이블(HuntingZoneTable)을 하나씩 순회
     for (const auto& zone : HuntingZoneTable) {
         std::cout << "▶ [" << zone.zone_name << "] 지역 배치 시작... (템플릿: "
             << MonsterTemplates[zone.template_index].name << ")\n";
 
-        // 구역 내부 가로세로 폭 계산
         int zone_width = zone.max_x - zone.min_x;
         int zone_height = zone.max_y - zone.min_y;
 
@@ -1288,23 +1639,18 @@ int main() {
             int i = MAX_PLAYERS + spawned_count;
             auto new_npc = std::make_shared<NPC>(i);
 
-            // 💥 [테이블 연동] 각 사냥터 테이블에 정의된 최소~최대 범위 안에서만 랜덤 좌표를 뽑아냅니다!
             int rx = zone.min_x + (rand() % zone_width);
             int ry = zone.min_y + (rand() % zone_height);
 
-            // 월드 오버플로우 방지 및 보정
             if (rx >= WORLD_WIDTH)  rx = WORLD_WIDTH - 1;
             if (ry >= WORLD_HEIGHT) ry = WORLD_HEIGHT - 1;
 
-            // world.csv 맵 파일과 대조해서 벽(1) 위에는 스폰을 완벽 차단합니다
             if (g_map[ry][rx] == 1) {
                 continue;
             }
 
-            // 몬스터 종류 템플릿 가져오기
             const auto& meta = MonsterTemplates[zone.template_index];
 
-            // NPC 객체 메모리에 데이터 주입
             new_npc->x = rx;
             new_npc->y = ry;
             new_npc->spawn_x = rx;
@@ -1317,7 +1663,8 @@ int main() {
             new_npc->stat.damage = meta.damage;
             new_npc->ai_type = meta.ai_type;
             new_npc->move_type = meta.move_type;
-			new_npc->gold_reward = meta.gold_reward;
+            new_npc->gold_reward = meta.gold_reward;
+            new_npc->visual_id = zone.template_index + 1;
 
             new_npc->_state = ST_INGAME;
             g_objects[i].store(new_npc);
@@ -1332,15 +1679,16 @@ int main() {
     std::cout << "물리 테이블 기준 20만 마리 구역 분할 기획 배치 완료!\n";
 
     h_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 0);
-    h_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 0);
     CreateIoCompletionPort(reinterpret_cast<HANDLE>(g_s_socket), h_iocp, 9999, 0);
 
     g_c_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+    setsockopt(g_c_socket, IPPROTO_TCP, TCP_NODELAY, (char*)&opt_val, sizeof(opt_val));
+
     g_a_over._comp_type = OP_ACCEPT;
     int addr_size = sizeof(SOCKADDR_IN);
     AcceptEx(g_s_socket, g_c_socket, g_a_over._send_buf, 0, addr_size + 16, addr_size + 16, NULL, &g_a_over._over);
 
-    vector<thread> worker_threads; thread timer_th(timer_thread);
+    std::vector<std::thread> worker_threads; std::thread timer_th(timer_thread);
     for (unsigned int i = 0; i < std::thread::hardware_concurrency(); ++i) worker_threads.emplace_back(worker_thread, h_iocp);
     for (auto& th : worker_threads) th.join();
     timer_th.join(); closesocket(g_s_socket); WSACleanup();

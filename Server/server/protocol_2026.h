@@ -28,8 +28,6 @@ enum PACKET_TYPE {
 	C2S_REQUEST_INFO,	// Client to Server: Request other player info
 	// dungeon related actions
 	C2S_DUNGEON_ENTRY,	// Client to Server: Dungeon entry request
-	C2S_DUNGEON_EXIT,	// Client to Server: Dungeon exit request
-	// npc interaction and reinforcement
 	C2S_INTERACT,		// Client to Server: Interact with NPC (reinforce)
 	C2S_REINFORCE,		// Client to Server: Reinforce request (weapon upgrade)
 	// party related actions
@@ -57,7 +55,10 @@ enum PACKET_TYPE {
 	S2C_PARTY_INVITE_NOTI,	//	Server to Client: Party invite notification
 	S2C_PARTY_APPLY_NOTI,		//	Server to Client: Party application notification
 	S2C_PARTY_UPDATE,			//	Server to Client: Party status update (e.g., new member, member left)
-	S2C_ATTACK_BROADCAST        // Server to Client: Broadcast attack action
+	S2C_ATTACK_BROADCAST,        // Server to Client: Broadcast attack action
+	S2C_GOLD_UPDATE,
+	S2C_BOSS_WARN_ZONE,
+	S2C_STATUS_EFFECT
 };
 
 enum OBJECT_TYPE {
@@ -103,7 +104,7 @@ const std::vector<PortalInfo> Portals = {
 };
 
 enum NPC_TYPE {
-	NPC_REINFORCE = 1, // 강화 상인
+	NPC_REINFORCE = 1, 
 };
 
 struct NpcSpawnInfo {
@@ -117,7 +118,7 @@ const std::vector<NpcSpawnInfo> g_npc_spawns = {
 };
 
 
-#pragma pack(push, 1) // Ensure no padding between struct members
+#pragma pack(push, 1)
 
 struct PartyMemberInfo {
 	int					playerId;
@@ -172,13 +173,6 @@ struct C2S_RequestInfo {
 };
 
 struct C2S_DungeonEntry {
-	unsigned char			size;
-	PACKET_TYPE				type;
-	DUNGEON_TYPE			dungeon;
-};
-
-struct C2S_DungeonExit
-{
 	unsigned char			size;
 	PACKET_TYPE				type;
 	DUNGEON_TYPE			dungeon;
@@ -365,4 +359,26 @@ struct S2C_AttackBroadcast {
 	WEAPON_TYPE   weapon;
 };
 
-#pragma pack(pop) // Restore default packing
+struct S2C_GoldUpdate {
+	unsigned char size;
+	PACKET_TYPE   type;
+	int           playerId;
+	int           gold;
+};
+
+struct S2C_BossWarnZone {
+	unsigned char size;
+	PACKET_TYPE   type;
+	short         x;          
+	short         y;           
+	int           radius;     
+	int           duration_ms; 
+};
+
+struct S2C_StatusEffect {
+	unsigned char size;
+	PACKET_TYPE   type;
+	bool          is_confused; 
+};
+
+#pragma pack(pop) 

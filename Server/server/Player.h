@@ -23,6 +23,7 @@ public:
 	int				last_move_time;
 	PlayerInfo		stat;
 	Session*			_session; 
+	bool				is_confused = false;
 
 	Player(int id);
 
